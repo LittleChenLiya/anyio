@@ -120,6 +120,33 @@ for example, the receiving tasks will never see the end of the stream while the
 original send stream remains open. Receive clones distribute items among consumers;
 they do not broadcast every item to every consumer.
 
+Receiving from multiple memory object streams
+---------------------------------------------
+
+To receive the next available item from any of several memory object streams, use
+:func:`~anyio.receive_any`. It returns a tuple of the index of the stream (in the
+order given) that produced the item, and the item itself::
+
+    from anyio import create_memory_object_stream, receive_any, run
+
+
+    async def main() -> None:
+        send1, receive1 = create_memory_object_stream[str](1)
+        send2, receive2 = create_memory_object_stream[str](1)
+        async with send1, receive1, send2, receive2:
+            send2.send_nowait("hello")
+            index, item = await receive_any([receive1, receive2])
+            print(f"received {item!r} from stream #{index}")
+
+
+    run(main)
+
+When several streams already have items available, the first one in the given order
+wins and the others are left untouched. Otherwise the call blocks until any of the
+streams receives an item, or raises :class:`~anyio.EndOfStream` once all of them
+have been closed from the sending end. Each receive stream may only be passed once;
+clones sharing the same underlying stream may not be passed together.
+
 In contrast to other AnyIO streams (but in line with Trio's Channels), memory object
 streams can be closed synchronously, using either the ``close()`` method or by using the
 stream as a context manager::

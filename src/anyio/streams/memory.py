@@ -4,10 +4,12 @@ __all__ = (
     "MemoryObjectReceiveStream",
     "MemoryObjectSendStream",
     "MemoryObjectStreamStatistics",
+    "receive_any",
 )
 
 import warnings
 from collections import OrderedDict, deque
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Generic, NamedTuple, TypeVar
@@ -50,6 +52,64 @@ class _MemoryObjectItemReceiver(Generic[T_Item]):
         # AttributeError: 'MemoryObjectItemReceiver' object has no attribute 'item'
         item = getattr(self, "item", None)
         return f"{self.__class__.__name__}(task_info={self.task_info}, item={item!r})"
+
+
+def _reclaim_item(state: _MemoryObjectStreamState[T_Item], item: T_Item) -> None:
+    # Hand the item to the next task waiting to receive, or put it back where it
+    # came from, ahead of any items sent afterwards
+    while state.waiting_receivers:
+        receive_event, receiver = state.waiting_receivers.popitem(last=False)
+        if not receiver.task_info.has_pending_cancellation():
+            receiver.item = item
+            receive_event.set()
+            return
+
+    if state.waiting_senders:
+        # The buffer is full, so requeue the item ahead of the waiting senders
+        send_event = Event()
+        state.waiting_senders = OrderedDict(
+            [(send_event, item), *state.waiting_senders.items()]
+        )
+    else:
+        state.buffer.appendleft(item)
+
+
+class _ReceiveAnyCoordinator(Generic[T_Item]):
+    """Coordinates the delivery of a single item to a receive_any() call."""
+
+    def __init__(self) -> None:
+        self.task_info = get_current_task()
+        self.event = Event()
+        self.delivered: tuple[_MemoryObjectStreamState[T_Item], T_Item] | None = None
+
+    def deliver(self, state: _MemoryObjectStreamState[T_Item], item: T_Item) -> None:
+        if self.delivered is None:
+            self.delivered = (state, item)
+        else:
+            # Another stream already won the race, so give this item back to the
+            # stream it came from to avoid losing it
+            _reclaim_item(state, item)
+
+
+class _ReceiveAnyItemReceiver(_MemoryObjectItemReceiver[T_Item]):
+    """Stands in for a regular item receiver in receive_any()."""
+
+    def __init__(
+        self,
+        coordinator: _ReceiveAnyCoordinator[T_Item],
+        state: _MemoryObjectStreamState[T_Item],
+    ) -> None:
+        self.task_info = coordinator.task_info
+        self._coordinator = coordinator
+        self._state = state
+
+    @property
+    def item(self) -> T_Item:
+        raise AttributeError("item")
+
+    @item.setter
+    def item(self, item: T_Item) -> None:
+        self._coordinator.deliver(self._state, item)
 
 
 @dataclass(eq=False)
@@ -193,6 +253,106 @@ class MemoryObjectReceiveStream(ObjectReceiveStream[T_co], Generic[T_co]):
                 stacklevel=1,
                 source=self,
             )
+
+
+async def receive_any(
+    receivers: Iterable[MemoryObjectReceiveStream[T_Item]],
+) -> tuple[int, T_Item]:
+    """
+    Receive the next item from any of the given memory object receive streams.
+
+    The streams are checked in the given order and the first one that has an item
+    available (either in its buffer or from a blocked sender) provides the item.
+    The other streams are left untouched. If no stream has an item available,
+    this function blocks, without polling, until one of them receives an item or
+    they have all been closed from the sending end. Streams that reach the end of
+    their stream are simply removed from consideration while others still have
+    senders left.
+
+    :param receivers: the receive streams to wait on (must not contain clones
+        sharing the same underlying stream state)
+    :return: a tuple of the index of the stream the item was received from, and
+        the item itself
+    :raises ValueError: if no receive streams were given, or if two or more of
+        them share the same underlying stream state
+    :raises ~anyio.ClosedResourceError: if any of the receive streams has been
+        closed
+    :raises ~anyio.EndOfStream: if all the streams have been closed from the
+        sending end and no more items are available
+
+    .. versionadded:: 4.16
+
+    """
+    await checkpoint()
+    receivers = tuple(receivers)
+    if not receivers:
+        raise ValueError("receive_any() requires at least one receive stream")
+
+    states: list[_MemoryObjectStreamState[T_Item]] = []
+    for receiver in receivers:
+        if not isinstance(receiver, MemoryObjectReceiveStream):
+            raise TypeError(
+                "receive_any() only accepts MemoryObjectReceiveStream instances"
+            )
+        if receiver._closed:
+            raise ClosedResourceError("receive_any() was given a closed receive stream")
+        if receiver._state in states:
+            raise ValueError(
+                "receive_any() was given multiple receive streams that share the"
+                " same underlying stream state"
+            )
+
+        states.append(receiver._state)
+
+    index_by_state = {state: index for index, state in enumerate(states)}
+    active = list(range(len(receivers)))
+    coordinator = _ReceiveAnyCoordinator[T_Item]()
+    try:
+        while active:
+            # Try to receive an item without blocking, in the given order
+            remaining: list[int] = []
+            for index in active:
+                try:
+                    return index, receivers[index].receive_nowait()
+                except WouldBlock:
+                    remaining.append(index)
+                except EndOfStream:
+                    pass
+
+            active = remaining
+            if not active:
+                break
+
+            # Register a waiter on each remaining stream and wait until one of
+            # them delivers an item or reaches the end of its stream. The waiters
+            # are queued behind any tasks already waiting on receive(), so they
+            # cannot jump the queue.
+            coordinator.event = Event()
+            active_states = [states[index] for index in active]
+            for state in active_states:
+                state.waiting_receivers[coordinator.event] = _ReceiveAnyItemReceiver(
+                    coordinator, state
+                )
+
+            try:
+                await coordinator.event.wait()
+            finally:
+                for state in active_states:
+                    state.waiting_receivers.pop(coordinator.event, None)
+
+            if coordinator.delivered is not None:
+                state, item = coordinator.delivered
+                coordinator.delivered = None
+                return index_by_state[state], item
+    except BaseException:
+        if coordinator.delivered is not None:
+            # The item was already delivered to us but cannot be returned to the
+            # caller, so hand it back to the stream to avoid losing it
+            _reclaim_item(*coordinator.delivered)
+
+        raise
+
+    raise EndOfStream
 
 
 @dataclass(eq=False)

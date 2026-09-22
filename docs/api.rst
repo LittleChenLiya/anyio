@@ -112,6 +112,7 @@ Streams and stream wrappers
 ---------------------------
 
 .. autofunction:: anyio.create_memory_object_stream
+.. autofunction:: anyio.receive_any
 
 .. autoclass:: anyio.abc.UnreliableObjectReceiveStream()
 .. autoclass:: anyio.abc.UnreliableObjectSendStream()
