@@ -4,10 +4,12 @@ __all__ = (
     "MemoryObjectReceiveStream",
     "MemoryObjectSendStream",
     "MemoryObjectStreamStatistics",
+    "receive_any",
 )
 
 import warnings
 from collections import OrderedDict, deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Generic, NamedTuple, TypeVar
@@ -45,6 +47,13 @@ class _MemoryObjectItemReceiver(Generic[T_Item]):
     task_info: TaskInfo = field(init=False, default_factory=get_current_task)
     item: T_Item = field(init=False)
 
+    def try_deliver(self, item: T_Item) -> bool:
+        if self.task_info.has_pending_cancellation():
+            return False
+
+        self.item = item
+        return True
+
     def __repr__(self) -> str:
         # When item is not defined, we get following error with default __repr__:
         # AttributeError: 'MemoryObjectItemReceiver' object has no attribute 'item'
@@ -53,14 +62,55 @@ class _MemoryObjectItemReceiver(Generic[T_Item]):
 
 
 @dataclass(eq=False)
+class _MultiStreamItemReceiver(Generic[T_Item]):
+    """The shared winning-receiver state of a :func:`receive_any` wait."""
+
+    task_info: TaskInfo = field(init=False, default_factory=get_current_task)
+    event: Event = field(init=False, default_factory=Event)
+    index: int = field(init=False, default=-1)
+    item: T_Item = field(init=False)
+
+    def claim(self, index: int, item: T_Item) -> bool:
+        """
+        Atomically claim this receiver for an item delivered from ``index``.
+
+        :return: ``True`` if this receiver won the item, ``False`` if another stream
+            already won it or the waiting task has a pending cancellation
+
+        """
+        if self.index >= 0 or self.task_info.has_pending_cancellation():
+            return False
+
+        self.index = index
+        self.item = item
+        return True
+
+
+@dataclass(eq=False)
+class _MultiStreamRegistration(Generic[T_Item]):
+    """A per-stream-state registration of a :func:`receive_any` wait."""
+
+    receiver: _MultiStreamItemReceiver[T_Item]
+    index: int
+    task_info: TaskInfo = field(init=False, default_factory=get_current_task)
+
+    def try_deliver(self, item: T_Item) -> bool:
+        if self.task_info.has_pending_cancellation():
+            return False
+
+        return self.receiver.claim(self.index, item)
+
+
+@dataclass(eq=False)
 class _MemoryObjectStreamState(Generic[T_Item]):
     max_buffer_size: float = field()
     buffer: deque[T_Item] = field(init=False, default_factory=deque)
     open_send_channels: int = field(init=False, default=0)
     open_receive_channels: int = field(init=False, default=0)
-    waiting_receivers: OrderedDict[Event, _MemoryObjectItemReceiver[T_Item]] = field(
-        init=False, default_factory=OrderedDict
-    )
+    waiting_receivers: OrderedDict[
+        Event,
+        _MemoryObjectItemReceiver[T_Item] | _MultiStreamRegistration[T_Item],
+    ] = field(init=False, default_factory=OrderedDict)
     waiting_senders: OrderedDict[Event, T_Item] = field(
         init=False, default_factory=OrderedDict
     )
@@ -195,6 +245,101 @@ class MemoryObjectReceiveStream(ObjectReceiveStream[T_co], Generic[T_co]):
             )
 
 
+async def receive_any(
+    receivers: Sequence[MemoryObjectReceiveStream[T_Item]],
+) -> tuple[int, T_Item]:
+    """
+    Receive one item from any of the given memory object receive streams.
+
+    The call blocks until at least one of the streams has an item available, and then
+    receives a single item from the first such stream (in the order given in
+    ``receivers``). The other streams are left untouched: no items are removed from
+    them, and no items are speculatively received and put back. Streams that have
+    reached the end of data are skipped; the call only raises
+    :exc:`~anyio.EndOfStream` once every stream has reached the end of data.
+
+    For each underlying memory object stream, the resulting wait is queued after any
+    tasks that are already waiting on :meth:`MemoryObjectReceiveStream.receive` of the
+    same stream, so existing waiters cannot be overtaken. Clones of the same receive
+    stream share the same state and may therefore not be passed more than once.
+
+    :param receivers: the receive streams to wait on
+    :return: a tuple of (the index of the stream the item was received from, the item)
+    :raises ValueError: if ``receivers`` is empty or contains clones of the same
+        receive stream
+    :raises TypeError: if any member of ``receivers`` is not a
+        :class:`MemoryObjectReceiveStream`
+    :raises ~anyio.ClosedResourceError: if any member of ``receivers`` has been closed
+
+    """
+    if not receivers:
+        raise ValueError("the list of receive streams must not be empty")
+
+    states: list[_MemoryObjectStreamState[T_Item]] = []
+    for stream in receivers:
+        if not isinstance(stream, MemoryObjectReceiveStream):
+            raise TypeError(
+                "all receive streams must be MemoryObjectReceiveStream instances; "
+                f"got {type(stream).__name__!r}"
+            )
+        elif stream._state in states:
+            raise ValueError(
+                "receivers sharing the same underlying memory object stream (such as "
+                "clones of the same receive stream) cannot be passed more than once"
+            )
+
+        states.append(stream._state)
+
+    if any(stream._closed for stream in receivers):
+        raise ClosedResourceError
+
+    await checkpoint()
+    while True:
+        # First, try to receive immediately, honoring the order of the input streams.
+        all_closed = True
+        eof_streams: list[int] = []
+        for index, stream in enumerate(receivers):
+            if stream._closed:
+                continue
+
+            all_closed = False
+            try:
+                return index, stream.receive_nowait()
+            except WouldBlock:
+                pass
+            except EndOfStream:
+                eof_streams.append(index)
+
+        if all_closed:
+            raise ClosedResourceError
+        elif len(eof_streams) == sum(not stream._closed for stream in receivers):
+            raise EndOfStream
+
+        # Register a single wait on each stream that is still open for sending.
+        wait = _MultiStreamItemReceiver[T_Item]()
+        registrations: list[tuple[Event, _MemoryObjectStreamState[T_Item]]] = []
+        for index, stream in enumerate(receivers):
+            if stream._closed:
+                continue
+
+            state = stream._state
+            if state.open_send_channels:
+                registration = _MultiStreamRegistration[T_Item](
+                    receiver=wait, index=index
+                )
+                state.waiting_receivers[wait.event] = registration
+                registrations.append((wait.event, state))
+
+        try:
+            await wait.event.wait()
+        finally:
+            for event, state in registrations:
+                state.waiting_receivers.pop(event, None)
+
+        if wait.index >= 0:
+            return wait.index, wait.item
+
+
 @dataclass(eq=False)
 class MemoryObjectSendStream(ObjectSendStream[T_contra], Generic[T_contra]):
     _state: _MemoryObjectStreamState[T_contra]
@@ -222,8 +367,7 @@ class MemoryObjectSendStream(ObjectSendStream[T_contra], Generic[T_contra]):
 
         while self._state.waiting_receivers:
             receive_event, receiver = self._state.waiting_receivers.popitem(last=False)
-            if not receiver.task_info.has_pending_cancellation():
-                receiver.item = item
+            if receiver.try_deliver(item):
                 receive_event.set()
                 return
 

@@ -11,10 +11,12 @@ from anyio import (
     CancelScope,
     ClosedResourceError,
     EndOfStream,
+    Event,
     WouldBlock,
     create_memory_object_stream,
     create_task_group,
     fail_after,
+    receive_any,
     wait_all_tasks_blocked,
 )
 from anyio.streams.memory import (
@@ -524,3 +526,294 @@ async def test_memory_object_item_receiver_repr() -> None:
     receiver.item = "test_item"
     receiver_repr = repr(receiver)
     assert "item='test_item'" in receiver_repr
+
+
+async def test_receive_any_prefilled_order() -> None:
+    """The first ready stream in input order wins; the others stay untouched."""
+    send1, receive1 = create_memory_object_stream[str](1)
+    send2, receive2 = create_memory_object_stream[str](1)
+    send3, receive3 = create_memory_object_stream[str](1)
+    send1.send_nowait("first")
+    send2.send_nowait("second")
+    send3.send_nowait("third")
+
+    with fail_after(1):
+        index, item = await receive_any([receive1, receive2, receive3])
+
+    assert (index, item) == (0, "first")
+    assert receive2.receive_nowait() == "second"
+    assert receive3.receive_nowait() == "third"
+    for stream in (
+        send1,
+        send2,
+        send3,
+        receive1,
+        receive2,
+        receive3,
+    ):
+        stream.close()
+
+
+async def test_receive_any_waits_without_polling() -> None:
+    send1, receive1 = create_memory_object_stream[str](0)
+    send2, receive2 = create_memory_object_stream[str](0)
+
+    async def receiver(results: list[tuple[int, str]]) -> None:
+        results.append(await receive_any([receive1, receive2]))
+
+    results: list[tuple[int, str]] = []
+    with fail_after(1):
+        async with create_task_group() as tg:
+            tg.start_soon(receiver, results)
+            await wait_all_tasks_blocked()
+            assert receive1.statistics().tasks_waiting_receive == 1
+            assert receive2.statistics().tasks_waiting_receive == 1
+            await send2.send("hello")
+
+    assert results == [(1, "hello")]
+    assert receive1.statistics().tasks_waiting_receive == 0
+    assert receive2.statistics().tasks_waiting_receive == 0
+    for stream in (send1, send2, receive1, receive2):
+        stream.close()
+
+
+async def test_receive_any_cancel_after_registration() -> None:
+    """Cancelling after registration removes every per-stream registration."""
+    send1, receive1 = create_memory_object_stream[str](0)
+    send2, receive2 = create_memory_object_stream[str](0)
+
+    async with create_task_group() as tg:
+        tg.start_soon(receive_any, [receive1, receive2])
+        await wait_all_tasks_blocked()
+        assert receive1.statistics().tasks_waiting_receive == 1
+        assert receive2.statistics().tasks_waiting_receive == 1
+        tg.cancel_scope.cancel()
+
+    assert receive1.statistics().tasks_waiting_receive == 0
+    assert receive2.statistics().tasks_waiting_receive == 0
+    with pytest.raises(WouldBlock):
+        send1.send_nowait("one")
+    with pytest.raises(WouldBlock):
+        send2.send_nowait("two")
+    for stream in (send1, send2, receive1, receive2):
+        stream.close()
+
+
+async def test_receive_any_simultaneous_zero_buffer_sends() -> None:
+    """Only one of two racing zero-buffer senders wins; the other keeps waiting."""
+    send1, receive1 = create_memory_object_stream[str](0)
+    send2, receive2 = create_memory_object_stream[str](0)
+    barrier = Event()
+
+    async def sender(send_stream: MemoryObjectSendStream[str], item: str) -> None:
+        await barrier.wait()
+        await send_stream.send(item)
+
+    results: list[tuple[int, str]] = []
+
+    async def receiver() -> None:
+        results.append(await receive_any([receive1, receive2]))
+
+    with fail_after(1):
+        async with create_task_group() as tg:
+            tg.start_soon(sender, send1, "one")
+            tg.start_soon(sender, send2, "two")
+            tg.start_soon(receiver)
+            await wait_all_tasks_blocked()
+            barrier.set()
+            await wait_all_tasks_blocked()
+
+            # Exactly one of the senders is still waiting with its item.
+            waiting = [
+                stream
+                for stream in (receive1, receive2)
+                if stream.statistics().tasks_waiting_send == 1
+            ]
+            assert len(waiting) == 1
+            assert results == [(1, "two")] or results == [(0, "one")]
+            winner_index = results[0][0]
+            loser = receive1 if winner_index == 1 else receive2
+            loser_item = "one" if winner_index == 1 else "two"
+            assert await loser.receive() == loser_item
+
+    assert receive1.statistics().tasks_waiting_send == 0
+    assert receive2.statistics().tasks_waiting_send == 0
+    for stream in (send1, send2, receive1, receive2):
+        stream.close()
+
+
+async def test_receive_any_does_not_overtake_existing_waiter() -> None:
+    send1, receive1 = create_memory_object_stream[str](0)
+    send2, receive2 = create_memory_object_stream[str](0)
+
+    ordinary_results: list[str] = []
+    any_results: list[tuple[int, str]] = []
+
+    async def ordinary_receiver() -> None:
+        ordinary_results.append(await receive1.receive())
+
+    async def any_receiver() -> None:
+        any_results.append(await receive_any([receive1, receive2]))
+
+    with fail_after(1):
+        async with create_task_group() as tg:
+            tg.start_soon(ordinary_receiver)
+            await wait_all_tasks_blocked()
+            tg.start_soon(any_receiver)
+            await wait_all_tasks_blocked()
+            await send1.send("first")
+            await wait_all_tasks_blocked()
+            assert ordinary_results == ["first"]
+            assert any_results == []
+            assert receive1.statistics().tasks_waiting_receive == 1
+            await send2.send("second")
+
+    assert any_results == [(1, "second")]
+    for stream in (send1, send2, receive1, receive2):
+        stream.close()
+
+
+async def test_receive_any_partial_eof() -> None:
+    send1, receive1 = create_memory_object_stream[str](0)
+    send2, receive2 = create_memory_object_stream[str](0)
+    await send1.aclose()
+
+    with fail_after(1):
+        async with create_task_group() as tg:
+            tg.start_soon(send2.send, "late")
+            assert await receive_any([receive1, receive2]) == (1, "late")
+
+    for stream in (send1, send2, receive1, receive2):
+        stream.close()
+
+
+async def test_receive_any_all_eof() -> None:
+    send1, receive1 = create_memory_object_stream[str](0)
+    send2, receive2 = create_memory_object_stream[str](0)
+    await send1.aclose()
+    await send2.aclose()
+
+    with pytest.raises(EndOfStream):
+        await receive_any([receive1, receive2])
+
+    for stream in (send1, send2, receive1, receive2):
+        stream.close()
+
+
+async def test_receive_any_open_stream_wakes_after_partial_eof() -> None:
+    send1, receive1 = create_memory_object_stream[str](0)
+    send2, receive2 = create_memory_object_stream[str](0)
+
+    # One stream reaches EOF; the other still delivers data.
+    await send1.aclose()
+    results: list[tuple[int, str]] = []
+
+    async def receiver() -> None:
+        results.append(await receive_any([receive1, receive2]))
+
+    with fail_after(1):
+        async with create_task_group() as tg:
+            tg.start_soon(receiver)
+            await wait_all_tasks_blocked()
+            assert results == []
+            tg.start_soon(send2.send, "late")
+
+    assert results == [(1, "late")]
+
+    await send2.aclose()
+    with pytest.raises(EndOfStream):
+        await receive_any([receive1, receive2])
+
+    for stream in (send1, send2, receive1, receive2):
+        stream.close()
+
+
+async def test_receive_any_buffered_item_before_eof() -> None:
+    send1, receive1 = create_memory_object_stream[str](1)
+    send2, receive2 = create_memory_object_stream[str](1)
+    await send1.send("buffered")
+    await send1.aclose()
+    await send2.aclose()
+
+    assert await receive_any([receive1, receive2]) == (0, "buffered")
+    with pytest.raises(EndOfStream):
+        await receive_any([receive1, receive2])
+
+    for stream in (send1, send2, receive1, receive2):
+        stream.close()
+
+
+async def test_receive_any_clone_closed() -> None:
+    send1, receive1 = create_memory_object_stream[str]()
+    send2, receive2 = create_memory_object_stream[str]()
+    await receive1.aclose()
+
+    with pytest.raises(ClosedResourceError):
+        await receive_any([receive1, receive2])
+
+    for stream in (send1, send2, receive1, receive2):
+        stream.close()
+
+
+async def test_receive_any_duplicate_state() -> None:
+    send, receive = create_memory_object_stream[str]()
+    clone = receive.clone()
+    with pytest.raises(ValueError, match="cannot be passed more than once"):
+        await receive_any([receive, clone])
+
+    send.close()
+    receive.close()
+    clone.close()
+
+
+async def test_receive_any_empty() -> None:
+    with pytest.raises(ValueError, match="must not be empty"):
+        await receive_any([])
+
+
+async def test_receive_any_wrong_type() -> None:
+    send, receive = create_memory_object_stream[str]()
+    receivers: list[object] = [receive, "not a stream"]
+    with pytest.raises(TypeError, match="MemoryObjectReceiveStream"):
+        await receive_any(receivers)  # type: ignore[arg-type]
+
+    send.close()
+    receive.close()
+
+
+async def test_receive_any_many_producers() -> None:
+    """Zero-buffer fan-in: every item is delivered exactly once and EOF is clean."""
+    stream_count = 3
+    items_per_stream = 20
+    streams = [create_memory_object_stream[int](0) for _ in range(stream_count)]
+    senders = [pair[0] for pair in streams]
+    receivers = [pair[1] for pair in streams]
+    counts = [0] * stream_count
+
+    async def producer(index: int) -> None:
+        async with senders[index]:
+            for value in range(items_per_stream):
+                await senders[index].send(value)
+
+    async def consumer() -> None:
+        while True:
+            try:
+                index, value = await receive_any(receivers)
+            except EndOfStream:
+                return
+
+            assert value == counts[index]
+            counts[index] += 1
+
+    with fail_after(20):
+        async with create_task_group() as tg:
+            for index in range(stream_count):
+                tg.start_soon(producer, index)
+            tg.start_soon(consumer)
+
+    assert counts == [items_per_stream] * stream_count
+    for receive_stream in receivers:
+        stats = receive_stream.statistics()
+        assert stats.tasks_waiting_receive == 0
+        assert stats.tasks_waiting_send == 0
+        receive_stream.close()

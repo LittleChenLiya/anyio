@@ -9,6 +9,7 @@ from ..streams.memory import (
     MemoryObjectSendStream,
     _MemoryObjectStreamState,
 )
+from ..streams.memory import receive_any as receive_any  # noqa: PLC0414
 
 T_Item = TypeVar("T_Item")
 
