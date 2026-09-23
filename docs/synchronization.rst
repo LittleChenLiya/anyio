@@ -226,6 +226,92 @@ Example::
     # Task number 8 is now working with the shared resource
     # Task number 9 is now working with the shared resource
 
+Weighted capacity limiters
+--------------------------
+
+Weighted capacity limiters (:class:`WeightedCapacityLimiter`) are like
+capacity limiters except that each acquisition can borrow several tokens at once.
+The number of tokens requested (the *weight*) is deducted atomically when the
+request is granted and returned in one piece on release. Both the total capacity
+and every weight must be positive integers, and a request whose weight exceeds the
+total capacity is rejected immediately.
+
+Waiting requests are served strictly in arrival order: when the request at the head
+of the queue does not fit in the available capacity, later (smaller) requests are
+not allowed to overtake it. Lowering ``total_tokens`` below the number
+of currently borrowed tokens is allowed; existing borrowers keep their tokens and
+new grants are deferred until enough capacity has been released. Raising
+``total_tokens`` wakes up queued waiters in arrival order.
+
+Example::
+
+    from anyio import (
+        CancelScope,
+        WeightedCapacityLimiter,
+        create_task_group,
+        fail_after,
+        run,
+        sleep,
+        wait_all_tasks_blocked,
+    )
+
+
+    async def main():
+        limiter = WeightedCapacityLimiter(5)
+        limiter.acquire_on_behalf_of_nowait("main", 4)
+        print(f"main borrowed 4: borrowed={limiter.borrowed_tokens}")
+
+        scopes = {}
+
+        async def worker(name, weight):
+            with CancelScope() as scope:
+                scopes[name] = scope
+                await limiter.acquire_on_behalf_of(name, weight)
+
+            if scope.cancelled_caught:
+                print(f"{name}: request for {weight} token(s) was cancelled")
+                return
+
+            print(f"{name}: granted {weight}, borrowed={limiter.borrowed_tokens}")
+            await sleep(0.1)
+            limiter.release_on_behalf_of(name)
+            print(f"{name}: released {weight}, borrowed={limiter.borrowed_tokens}")
+
+        async with create_task_group() as tg:
+            tg.start_soon(worker, "big", 3)
+            tg.start_soon(worker, "small", 1)
+            await wait_all_tasks_blocked()
+            stats = limiter.statistics()
+            print(f"FIFO queue before cancel: waiting_weights={stats.waiting_weights}")
+            scopes["big"].cancel()
+            with fail_after(5):
+                while limiter.borrowed_tokens < 5:
+                    await sleep(0.01)
+
+            stats = limiter.statistics()
+            print(f"after cancel: borrowed={stats.borrowed_tokens}, "
+                  f"waiting_weights={stats.waiting_weights}")
+
+        limiter.release_on_behalf_of("main")
+        stats = limiter.statistics()
+        print(f"final: borrowed={stats.borrowed_tokens}, "
+              f"available={stats.total_tokens}")
+        assert stats.borrowed_tokens == 0
+        print("all tokens returned")
+
+
+    run(main)
+
+    # Output:
+    # main borrowed 4: borrowed=4
+    # FIFO queue before cancel: waiting_weights=(3, 1)
+    # big: request for 3 token(s) was cancelled
+    # small: granted 1, borrowed=5
+    # after cancel: borrowed=5, waiting_weights=()
+    # small: released 1, borrowed=4
+    # final: borrowed=0, available=5
+    # all tokens returned
+
 Resource guards
 ---------------
 

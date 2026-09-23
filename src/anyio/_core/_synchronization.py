@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import math
 import sys
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import TracebackType
 from typing import TypeVar
 
-from ..lowlevel import checkpoint_if_cancelled
+from ..lowlevel import cancel_shielded_checkpoint, checkpoint_if_cancelled
 from ._eventloop import get_async_backend
-from ._exceptions import BusyResourceError, NoEventLoopError
+from ._exceptions import BusyResourceError, NoEventLoopError, WouldBlock
 from ._tasks import CancelScope
 from ._testing import TaskInfo, get_current_task
 
@@ -47,6 +47,29 @@ class CapacityLimiterStatistics:
     total_tokens: float
     borrowers: tuple[object, ...]
     tasks_waiting: int
+
+
+@dataclass(frozen=True)
+class WeightedCapacityLimiterStatistics:
+    """
+    :ivar int borrowed_tokens: number of tokens currently borrowed by tasks
+    :ivar int total_tokens: total number of available tokens
+    :ivar tuple borrowers: tasks or other objects currently holding tokens borrowed
+        from this limiter
+    :ivar int tasks_waiting: number of tasks waiting on
+        :meth:`~.WeightedCapacityLimiter.acquire` or
+        :meth:`~.WeightedCapacityLimiter.acquire_on_behalf_of`
+    :ivar tuple waiting_weights: the weights of the queued acquisition requests, in
+        arrival order
+
+    .. versionadded:: 4.16
+    """
+
+    borrowed_tokens: int
+    total_tokens: int
+    borrowers: tuple[object, ...]
+    tasks_waiting: int
+    waiting_weights: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -738,6 +761,225 @@ class CapacityLimiterAdapter(CapacityLimiter):
             )
 
         return self._internal_limiter.statistics()
+
+
+class WeightedCapacityLimiter:
+    """
+    A capacity limiter that grants a caller-chosen number of tokens atomically.
+
+    Unlike :class:`CapacityLimiter`, a single acquisition can borrow several tokens
+    (its *weight*) at once. The full weight is deducted in one atomic step when the
+    request is granted, and returned in one step on release. Waiting requests are
+    served strictly in arrival order: if the request at the head of the queue does
+    not fit in the currently available capacity, later (smaller) requests are not
+    allowed to overtake it.
+
+    Both the total capacity and every weight must be positive integers (``bool``
+    values are rejected). A request whose weight exceeds the total capacity is
+    rejected immediately.
+
+    The total capacity can be changed at any time by assigning to
+    :attr:`total_tokens`. Lowering it below the number of currently borrowed tokens
+    is allowed; existing borrowers keep their tokens, and no new requests are granted
+    until enough capacity has been released. Raising it wakes up queued waiters in
+    arrival order.
+
+    This class works identically on all backends and can be instantiated outside an
+    event loop.
+
+    .. versionadded:: 4.16
+    """
+
+    __slots__ = ("__weakref__", "_borrowers", "_total_tokens", "_wait_queue")
+
+    def __init__(self, total_tokens: int) -> None:
+        self._total_tokens: int = 0
+        self._borrowers: dict[object, int] = {}
+        self._wait_queue: OrderedDict[object, tuple[int, Event]] = OrderedDict()
+        self.total_tokens = total_tokens
+
+    async def __aenter__(self) -> None:
+        await self.acquire()
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        self.release()
+
+    @property
+    def total_tokens(self) -> int:
+        """The total number of tokens available for borrowing."""
+        return self._total_tokens
+
+    @total_tokens.setter
+    def total_tokens(self, value: int) -> None:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError("total_tokens must be an int")
+
+        if value < 1:
+            raise ValueError("total_tokens must be >= 1")
+
+        self._total_tokens = value
+        self._notify_waiters()
+
+    @property
+    def borrowed_tokens(self) -> int:
+        """The number of tokens that have currently been borrowed."""
+        return sum(self._borrowers.values())
+
+    @property
+    def available_tokens(self) -> int:
+        """The number of tokens currently available to be borrowed."""
+        return self._total_tokens - self.borrowed_tokens
+
+    @staticmethod
+    def _validate_weight(weight: int) -> None:
+        if isinstance(weight, bool) or not isinstance(weight, int):
+            raise TypeError("weight must be an int")
+
+        if weight < 1:
+            raise ValueError("weight must be >= 1")
+
+    def _notify_waiters(self) -> None:
+        """Grant tokens to queued waiters, strictly in arrival order."""
+        while self._wait_queue:
+            borrower, (weight, event) = next(iter(self._wait_queue.items()))
+            if weight > self._total_tokens - self.borrowed_tokens:
+                break
+
+            del self._wait_queue[borrower]
+            self._borrowers[borrower] = weight
+            event.set()
+
+    def acquire_nowait(self, weight: int = 1) -> None:
+        """
+        Acquire tokens for the current task without waiting for them to become
+        available.
+
+        :param weight: the number of tokens to acquire
+        :raises ~anyio.WouldBlock: if there are not enough tokens available for
+            borrowing
+
+        """
+        self.acquire_on_behalf_of_nowait(get_current_task(), weight)
+
+    def acquire_on_behalf_of_nowait(self, borrower: object, weight: int = 1) -> None:
+        """
+        Acquire tokens without waiting for them to become available.
+
+        :param borrower: the entity borrowing the tokens
+        :param weight: the number of tokens to acquire
+        :raises ~anyio.WouldBlock: if there are not enough tokens available for
+            borrowing
+
+        """
+        self._validate_weight(weight)
+        if weight > self._total_tokens:
+            raise ValueError(
+                "weight must not exceed the total number of tokens "
+                f"({self._total_tokens})"
+            )
+
+        if borrower in self._borrowers or borrower in self._wait_queue:
+            raise RuntimeError(
+                "this borrower is already holding or waiting for tokens from this "
+                "WeightedCapacityLimiter"
+            )
+
+        if self._wait_queue or weight > self.available_tokens:
+            raise WouldBlock
+
+        self._borrowers[borrower] = weight
+
+    async def acquire(self, weight: int = 1) -> None:
+        """
+        Acquire tokens for the current task, waiting if necessary for enough of them
+        to become available.
+
+        :param weight: the number of tokens to acquire
+
+        """
+        await self.acquire_on_behalf_of(get_current_task(), weight)
+
+    async def acquire_on_behalf_of(self, borrower: object, weight: int = 1) -> None:
+        """
+        Acquire tokens, waiting if necessary for enough of them to become available.
+
+        :param borrower: the entity borrowing the tokens
+        :param weight: the number of tokens to acquire
+
+        """
+        self._validate_weight(weight)
+        if weight > self._total_tokens:
+            raise ValueError(
+                "weight must not exceed the total number of tokens "
+                f"({self._total_tokens})"
+            )
+
+        await checkpoint_if_cancelled()
+        try:
+            self.acquire_on_behalf_of_nowait(borrower, weight)
+        except WouldBlock:
+            event = Event()
+            self._wait_queue[borrower] = (weight, event)
+            try:
+                await event.wait()
+            except BaseException:
+                self._wait_queue.pop(borrower, None)
+                if event.is_set():
+                    # The tokens were granted but could not be delivered to the
+                    # caller, so return them to the pool
+                    del self._borrowers[borrower]
+
+                self._notify_waiters()
+                raise
+        else:
+            try:
+                await cancel_shielded_checkpoint()
+            except BaseException:
+                self.release_on_behalf_of(borrower)
+                raise
+
+    def release(self) -> None:
+        """
+        Release the tokens held by the current task.
+
+        :raises RuntimeError: if the current task has not borrowed any tokens from
+            this limiter
+
+        """
+        self.release_on_behalf_of(get_current_task())
+
+    def release_on_behalf_of(self, borrower: object) -> None:
+        """
+        Release the tokens held by the given borrower.
+
+        :raises RuntimeError: if the borrower has not borrowed any tokens from this
+            limiter
+
+        """
+        try:
+            del self._borrowers[borrower]
+        except KeyError:
+            raise RuntimeError(
+                "this borrower isn't holding any of this WeightedCapacityLimiter's "
+                "tokens"
+            ) from None
+
+        self._notify_waiters()
+
+    def statistics(self) -> WeightedCapacityLimiterStatistics:
+        """Return statistics about the current state of this limiter."""
+        return WeightedCapacityLimiterStatistics(
+            borrowed_tokens=self.borrowed_tokens,
+            total_tokens=self._total_tokens,
+            borrowers=tuple(self._borrowers),
+            tasks_waiting=len(self._wait_queue),
+            waiting_weights=tuple(weight for weight, _ in self._wait_queue.values()),
+        )
 
 
 class ResourceGuard:
