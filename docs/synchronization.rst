@@ -226,6 +226,79 @@ Example::
     # Task number 8 is now working with the shared resource
     # Task number 9 is now working with the shared resource
 
+.. _weighted-capacity-limiters:
+
+Weighted capacity limiters
+--------------------------
+
+Weighted capacity limiters (:class:`WeightedCapacityLimiter`) are like
+:class:`CapacityLimiter` except that each acquisition borrows a configurable number
+of tokens (its "weight") at once, atomically. Both the total capacity and every
+weight must be positive integers (note that :class:`bool` values are rejected), and
+any weight larger than the total capacity is rejected outright.
+
+Acquisitions are granted strictly in arrival order: when the request at the head of
+the queue does not fit in the remaining capacity, later (smaller) requests are not
+allowed to overtake it. Granting deducts the entire weight in one go, and releasing a
+borrower returns its original weight in one go. Cancellation is handled safely both
+while waiting and in the window between the grant and the waiting task resuming, so
+tokens are never leaked. The :meth:`~.WeightedCapacityLimiter.statistics` method
+reports the borrowed capacity along with the weight of every pending request.
+
+The total capacity can be lowered below the number of currently borrowed tokens.
+Existing borrowers keep their tokens, but no new acquisitions are granted until
+enough tokens have been released. Raising the capacity wakes up waiting tasks in
+arrival order.
+
+Example::
+
+    from anyio import (
+        CancelScope,
+        WeightedCapacityLimiter,
+        create_task_group,
+        run,
+        wait_all_tasks_blocked,
+    )
+
+
+    async def main():
+        limiter = WeightedCapacityLimiter(5)
+        limiter.acquire_on_behalf_of_nowait("holder", 4)
+        scopes = {}
+
+        async def borrow(name, weight):
+            with CancelScope() as scope:
+                scopes[name] = scope
+                await limiter.acquire_on_behalf_of(name, weight)
+                print(f"{name} got {weight} token(s); "
+                      f"borrowed={limiter.borrowed_tokens}")
+
+        async with create_task_group() as tg:
+            tg.start_soon(borrow, "heavy", 3)
+            await wait_all_tasks_blocked()
+            tg.start_soon(borrow, "light", 1)
+            await wait_all_tasks_blocked()
+            stats = limiter.statistics()
+            print(f"borrowed={stats.borrowed_tokens}, "
+                  f"waiting={stats.waiting_weights}")
+
+            # Cancel the head waiter; "light" can now claim the last token
+            scopes["heavy"].cancel()
+            await wait_all_tasks_blocked()
+            print(f"borrowed={limiter.borrowed_tokens}")
+
+            limiter.release_on_behalf_of("light")
+            limiter.release_on_behalf_of("holder")
+            print(f"borrowed={limiter.borrowed_tokens} (all tokens returned)")
+
+    run(main)
+
+    # Output:
+    # borrowed=4, waiting=(3, 1)
+    # light got 1 token(s); borrowed=5
+    # borrowed=5
+    # borrowed=0 (all tokens returned)
+
 Resource guards
 ---------------
 

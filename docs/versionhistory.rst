@@ -5,6 +5,9 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added ``WeightedCapacityLimiter``, a capacity limiter that grants a configurable
+  number of tokens (a weight) atomically per acquisition, with strictly
+  arrival-ordered (FIFO) wait queues
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends
