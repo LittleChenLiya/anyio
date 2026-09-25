@@ -123,6 +123,37 @@ class IncompleteRead(Exception):
         )
 
 
+class IncompleteRecord(Exception):
+    """
+    Raised during
+    :meth:`~anyio.streams.buffered.RecordReceiveStream.read_until` or
+    :meth:`~anyio.streams.buffered.RecordReceiveStream.discard_until` if the end of
+    the stream is reached before a complete record (terminated by the delimiter)
+    could be read or discarded, and the applicable end-of-stream policy is
+    ``"raise"``.
+
+    .. versionadded:: 4.16
+    """
+
+    def __init__(self, partial: bytes) -> None:
+        super().__init__("The stream ended before a complete record could be read")
+        #: the leftover bytes that did not form a complete record
+        self.partial: bytes = partial
+
+
+class RecordStateError(Exception):
+    """
+    Raised when a record-oriented read operation is not allowed in the current
+    state of a :class:`~anyio.streams.buffered.RecordReceiveStream`, for example
+    when calling
+    :meth:`~anyio.streams.buffered.RecordReceiveStream.read_until` while an
+    oversized record is still waiting to be discarded with
+    :meth:`~anyio.streams.buffered.RecordReceiveStream.discard_until`.
+
+    .. versionadded:: 4.16
+    """
+
+
 class TypedAttributeLookupError(LookupError):
     """
     Raised by :meth:`~anyio.TypedAttributeProvider.extra` when the given typed attribute

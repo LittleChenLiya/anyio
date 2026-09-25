@@ -4,14 +4,23 @@ __all__ = (
     "BufferedByteReceiveStream",
     "BufferedByteStream",
     "BufferedConnectable",
+    "RecordReceiveStream",
 )
 
 import sys
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, SupportsIndex
+from typing import Any, Literal, SupportsIndex
 
-from .. import ClosedResourceError, DelimiterNotFound, EndOfStream, IncompleteRead
+from .. import (
+    BusyResourceError,
+    ClosedResourceError,
+    DelimiterNotFound,
+    EndOfStream,
+    IncompleteRead,
+    IncompleteRecord,
+    RecordStateError,
+)
 from ..abc import (
     AnyByteReceiveStream,
     AnyByteStream,
@@ -129,11 +138,10 @@ class BufferedByteReceiveStream(ByteReceiveStream):
             bytes read up to the maximum allowed
 
         """
-        delimiter_size = len(delimiter)
         offset = 0
         while True:
             # Check if the delimiter can be found in the current buffer
-            index = self._buffer.find(delimiter, offset)
+            index, offset = self._find_delimiter(delimiter, offset)
             if index >= 0:
                 found = self._buffer[:index]
                 del self._buffer[: index + len(delimiter) :]
@@ -149,9 +157,243 @@ class BufferedByteReceiveStream(ByteReceiveStream):
             except EndOfStream as exc:
                 raise IncompleteRead from exc
 
-            # Move the offset forward and add the new data to the buffer
-            offset = max(len(self._buffer) - delimiter_size + 1, 0)
+            # Add the new data to the buffer
             self._buffer.extend(data)
+
+    def _find_delimiter(self, delimiter: bytes, offset: int) -> tuple[int, int]:
+        """
+        Search the buffer for the delimiter, starting from the given offset.
+
+        :param delimiter: the marker to look for in the buffer
+        :param offset: the buffer index to start the search from
+        :return: a tuple of (index of the delimiter, or -1 if not found; the offset
+            to continue the search from when more data has been appended to the
+            buffer)
+
+        """
+        index = self._buffer.find(delimiter, offset)
+        next_offset = max(len(self._buffer) - len(delimiter) + 1, 0)
+        return index, next_offset
+
+
+@dataclass(eq=False)
+class RecordReceiveStream(BufferedByteReceiveStream):
+    """
+    Wraps any bytes-based receive stream and provides record-oriented reading on
+    top of the buffering capabilities of :class:`BufferedByteReceiveStream`.
+
+    Records are read with :meth:`read_until` which enforces a per-record byte
+    limit. When a record exceeds the limit, the stream enters the
+    ``needs_discard`` state where further reads are rejected until the rest of
+    the oversized record has been discarded with :meth:`discard_until`. This
+    ensures that the remainder of an oversized record is never mistaken for the
+    next record.
+
+    .. versionadded:: 4.16
+    """
+
+    _state: Literal["ready", "needs_discard"] = field(init=False, default="ready")
+    _reading: bool = field(init=False, default=False)
+
+    @property
+    def state(self) -> str:
+        """
+        The current state of the record reader.
+
+        The state is ``ready`` when records can be read with :meth:`read_until`,
+        and ``needs_discard`` when an oversized record must first be discarded
+        with :meth:`discard_until`.
+        """
+        return self._state
+
+    def _start_read_operation(self) -> None:
+        if self._closed:
+            raise ClosedResourceError
+
+        if self._reading:
+            raise BusyResourceError("reading from")
+
+        self._reading = True
+
+    async def read_until(
+        self,
+        delimiter: bytes,
+        max_bytes: int,
+        *,
+        include_delimiter: bool = False,
+        on_eof: Literal["raise", "return"] = "raise",
+    ) -> bytes:
+        """
+        Read a single record from the stream, terminated by the delimiter.
+
+        If the record exceeds ``max_bytes`` bytes (not counting the delimiter),
+        :exc:`~anyio.DelimiterNotFound` is raised and the stream enters the
+        ``needs_discard`` state. While in that state, further calls to this
+        method raise :exc:`~anyio.RecordStateError` until the remainder of the
+        oversized record has been discarded with :meth:`discard_until`.
+
+        This method is cancellation safe: if the read is cancelled, no bytes are
+        lost and the read can be retried.
+
+        :param delimiter: the marker terminating the record
+        :param max_bytes: the maximum number of bytes a record may contain (not
+            counting the delimiter) before it is considered oversized
+        :param include_delimiter: if ``True``, include the delimiter in the
+            returned record
+        :param on_eof: the policy applied when the end of the stream is reached
+            before the delimiter: ``"raise"`` to raise
+            :exc:`~anyio.IncompleteRecord`, or ``"return"`` to return (and
+            consume) the partial record
+        :return: the record, without the delimiter (unless ``include_delimiter``
+            was ``True``)
+        :raises ~anyio.RecordStateError: if the stream is in the
+            ``needs_discard`` state
+        :raises ~anyio.DelimiterNotFound: if the record exceeds ``max_bytes``
+            bytes
+        :raises ~anyio.IncompleteRecord: if the end of the stream is reached
+            before the delimiter and ``on_eof`` is ``"raise"``
+        :raises ~anyio.BusyResourceError: if another record read or discard
+            operation is already in progress
+
+        """
+        if not delimiter:
+            raise ValueError("delimiter must not be empty")
+
+        if max_bytes < 0:
+            raise ValueError("max_bytes must be a non-negative integer")
+
+        if on_eof not in ("raise", "return"):
+            raise ValueError("on_eof must be either 'raise' or 'return'")
+
+        if self._closed:
+            raise ClosedResourceError
+
+        if self._state != "ready":
+            raise RecordStateError(
+                "an oversized record is pending discard; call discard_until() "
+                "before reading more records"
+            )
+
+        self._start_read_operation()
+        try:
+            delimiter_size = len(delimiter)
+            offset = 0
+            while True:
+                # Check if the delimiter can be found in the current buffer
+                index, offset = self._find_delimiter(delimiter, offset)
+                if index >= 0:
+                    if index > max_bytes:
+                        self._state = "needs_discard"
+                        raise DelimiterNotFound(max_bytes)
+
+                    end = index + delimiter_size
+                    record_end = end if include_delimiter else index
+                    record = bytes(self._buffer[:record_end])
+                    del self._buffer[:end]
+                    return record
+
+                # Check if the record is provably over the limit, leaving room
+                # for a partial delimiter at the end of the buffer
+                if len(self._buffer) - (delimiter_size - 1) > max_bytes:
+                    self._state = "needs_discard"
+                    raise DelimiterNotFound(max_bytes)
+
+                # Read more data into the buffer from the stream
+                try:
+                    data = await self.receive_stream.receive()
+                except EndOfStream:
+                    if on_eof == "return":
+                        partial = bytes(self._buffer)
+                        del self._buffer[:]
+                        return partial
+
+                    raise IncompleteRecord(bytes(self._buffer)) from None
+
+                self._buffer.extend(data)
+        finally:
+            self._reading = False
+
+    async def discard_until(self, delimiter: bytes, max_bytes: int = 65536) -> int:
+        """
+        Discard the remainder of an oversized record, up to and including the
+        next delimiter.
+
+        This method is used to recover from the ``needs_discard`` state (see
+        :meth:`read_until`). Once the delimiter terminating the oversized record
+        has been consumed, the stream returns to the ``ready`` state.
+
+        Discarding is limited to a budget of ``max_bytes`` bytes per call. If
+        the budget runs out (or the operation is cancelled) before the delimiter
+        is found, the method can simply be called again to continue discarding;
+        bytes already discarded are never re-exposed. The last
+        ``len(delimiter) - 1`` bytes are always kept in the buffer so that a
+        delimiter straddling the budget boundary is never partially discarded.
+
+        Does nothing and returns 0 if the stream is not in the
+        ``needs_discard`` state.
+
+        :param delimiter: the marker terminating the oversized record
+        :param max_bytes: the maximum number of bytes to discard in this call
+        :return: the number of bytes discarded in this call (including the
+            delimiter, if the end of the record was reached)
+        :raises ~anyio.IncompleteRecord: if the end of the stream is reached
+            before the delimiter
+        :raises ~anyio.BusyResourceError: if another record read or discard
+            operation is already in progress
+
+        """
+        if not delimiter:
+            raise ValueError("delimiter must not be empty")
+
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer")
+
+        self._start_read_operation()
+        discarded = 0
+        try:
+            if self._state != "needs_discard":
+                return 0
+
+            delimiter_size = len(delimiter)
+            offset = 0
+            while True:
+                index, offset = self._find_delimiter(delimiter, offset)
+                if index >= 0 and discarded + index + delimiter_size <= max_bytes:
+                    # The delimiter is within the budget: finish the record
+                    end = index + delimiter_size
+                    del self._buffer[:end]
+                    discarded += end
+                    self._state = "ready"
+                    return discarded
+
+                # Determine how many bytes can be discarded without touching a
+                # (possibly partial) delimiter
+                if index >= 0:
+                    safe = index
+                else:
+                    safe = max(len(self._buffer) - delimiter_size + 1, 0)
+
+                if safe and discarded < max_bytes:
+                    amount = min(safe, max_bytes - discarded)
+                    del self._buffer[:amount]
+                    discarded += amount
+                    offset = 0
+                    continue
+
+                if index >= 0 or discarded >= max_bytes:
+                    # The delimiter is within reach but consuming it would exceed
+                    # the budget, or the budget has been exhausted
+                    return discarded
+
+                # Read more data into the buffer from the stream
+                try:
+                    data = await self.receive_stream.receive()
+                except EndOfStream:
+                    raise IncompleteRecord(bytes(self._buffer)) from None
+
+                self._buffer.extend(data)
+        finally:
+            self._reading = False
 
 
 class BufferedByteStream(BufferedByteReceiveStream, ByteStream):

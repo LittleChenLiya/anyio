@@ -136,6 +136,7 @@ Streams and stream wrappers
 
 .. autoclass:: anyio.streams.buffered.BufferedByteReceiveStream
 .. autoclass:: anyio.streams.buffered.BufferedByteStream
+.. autoclass:: anyio.streams.buffered.RecordReceiveStream
 .. autoclass:: anyio.streams.file.FileStreamAttribute
 .. autoclass:: anyio.streams.file.FileReadStream
 .. autoclass:: anyio.streams.file.FileWriteStream
@@ -284,7 +285,9 @@ Exceptions
 .. autoexception:: anyio.FutureFailed
 .. autoexception:: anyio.FutureNotFinished
 .. autoexception:: anyio.IncompleteRead
+.. autoexception:: anyio.IncompleteRecord
 .. autoexception:: anyio.NoEventLoopError
+.. autoexception:: anyio.RecordStateError
 .. autoexception:: anyio.RunFinishedError
 .. autoexception:: anyio.TaskFailed
 .. autoexception:: anyio.TaskCancelled

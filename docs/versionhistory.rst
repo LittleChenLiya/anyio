@@ -5,6 +5,12 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added the ``anyio.streams.buffered.RecordReceiveStream`` class which provides
+  record-oriented reading on top of ``BufferedByteReceiveStream``, with a
+  per-record byte limit, an explicit ``needs_discard`` state and budgeted
+  ``discard_until()`` recovery for oversized records, an optional delimiter
+  inclusion flag and a configurable end-of-stream policy (along with the new
+  ``anyio.IncompleteRecord`` and ``anyio.RecordStateError`` exceptions)
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends

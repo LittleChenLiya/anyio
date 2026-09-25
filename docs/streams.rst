@@ -179,6 +179,46 @@ The above script gives the following output::
 .. tip:: In some cases, you may need to inject data directly into the buffer. You can do
     that with the :meth:`~.streams.buffered.BufferedByteReceiveStream.feed_data` method.
 
+Record streams
+--------------
+
+A record stream (:class:`~.streams.buffered.RecordReceiveStream`) builds on the
+buffered byte stream to read delimiter-terminated records with a per-record byte
+limit. When a record exceeds the limit, :exc:`~anyio.DelimiterNotFound` is raised and
+the stream enters the ``needs_discard`` state where further reads are rejected with
+:exc:`~anyio.RecordStateError` until the remainder of the oversized record has been
+discarded with :meth:`~.streams.buffered.RecordReceiveStream.discard_until` (which can
+be called repeatedly with a byte budget, and is safe to cancel and resume). This
+guarantees that the rest of an oversized record is never mistaken for the next
+record.
+
+Example::
+
+    from anyio import DelimiterNotFound, run, create_memory_object_stream
+    from anyio.streams.buffered import RecordReceiveStream
+
+
+    async def main():
+        send, receive = create_memory_object_stream[bytes](4)
+        records = RecordReceiveStream(receive)
+        await send.send(b`hello`)
+        await send.send(b`\r\nworld\r\n`)
+
+        print(await records.read_until(b`\r\n`, 5))
+        print(await records.read_until(b`\r\n`, 5))
+
+    run(main)
+
+The above script gives the following output::
+
+    b`hello`
+    b`world`
+
+By default, reaching the end of the stream in the middle of a record raises
+:exc:`~anyio.IncompleteRecord`. Passing ``on_eof=`"return"``` to
+:meth:`~.streams.buffered.RecordReceiveStream.read_until` makes it return the partial
+record instead.
+
 Text streams
 ------------
 
