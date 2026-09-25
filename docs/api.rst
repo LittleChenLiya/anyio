@@ -142,6 +142,10 @@ Streams and stream wrappers
 .. autoclass:: anyio.streams.memory.MemoryObjectReceiveStream
 .. autoclass:: anyio.streams.memory.MemoryObjectSendStream
 .. autoclass:: anyio.streams.memory.MemoryObjectStreamStatistics
+.. autoclass:: anyio.streams.records.RecordReceiveStream
+.. autoclass:: anyio.streams.records.RecordStreamState
+.. autoexception:: anyio.streams.records.RecordTooLong
+.. autoexception:: anyio.streams.records.RecordStreamStateError
 .. autoclass:: anyio.streams.stapled.MultiListener
 .. autoclass:: anyio.streams.stapled.StapledByteStream
 .. autoclass:: anyio.streams.stapled.StapledObjectStream
@@ -284,6 +288,7 @@ Exceptions
 .. autoexception:: anyio.FutureFailed
 .. autoexception:: anyio.FutureNotFinished
 .. autoexception:: anyio.IncompleteRead
+.. autoexception:: anyio.IncompleteRecord
 .. autoexception:: anyio.NoEventLoopError
 .. autoexception:: anyio.RunFinishedError
 .. autoexception:: anyio.TaskFailed

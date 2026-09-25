@@ -112,6 +112,7 @@ extend-safe-fixes = ["TC001"]
 [tool.ruff.lint.per-file-ignores]
 "tests/test_tempfile.py" = ["ASYNC230"]
 "tests/*.py" = ["ASYNC240"]
+"demo_record_stream.py" = ["T201"]
 
 [tool.mypy]
 python_version = "3.14"

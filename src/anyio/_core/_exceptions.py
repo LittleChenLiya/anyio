@@ -123,6 +123,24 @@ class IncompleteRead(Exception):
         )
 
 
+class IncompleteRecord(Exception):
+    """
+    Raised during
+    :meth:`~anyio.streams.records.RecordReceiveStream.read_until` if the stream ends
+    before a complete, delimiter-terminated record could be read and the record
+    stream EOF policy is ``raise``.
+
+    The partial record bytes are available via the :attr:`partial` attribute.
+    """
+
+    def __init__(self, partial: bytes) -> None:
+        super().__init__(
+            "The stream ended before a complete record could be read "
+            f"({len(partial)} bytes were left over)"
+        )
+        self.partial = partial
+
+
 class TypedAttributeLookupError(LookupError):
     """
     Raised by :meth:`~anyio.TypedAttributeProvider.extra` when the given typed attribute
