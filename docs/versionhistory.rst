@@ -5,6 +5,13 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added acknowledgement queues (``create_ack_queue()``): receiving returns an item
+  together with a ``MessageAcknowledgeHandle`` used to acknowledge successful
+  processing, the send stream provides ``join()`` for waiting until all outstanding
+  items are acknowledged, unacknowledged items held by cancelled consumers (or
+  explicitly requeued) are redelivered first while keeping their identity, and the
+  capacity counts both queued and in-flight items. Duplicate acknowledgement raises
+  ``DuplicateAcknowledgeError``
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends

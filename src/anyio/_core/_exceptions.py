@@ -103,6 +103,13 @@ class DelimiterNotFound(Exception):
         )
 
 
+class DuplicateAcknowledgeError(Exception):
+    """
+    Raised when a message from an acknowledgement queue is acknowledged more than
+    once.
+    """
+
+
 class EndOfStream(Exception):
     """
     Raised when trying to read from a stream that has been closed from the other end.

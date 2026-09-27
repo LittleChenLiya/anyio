@@ -9,6 +9,7 @@ from ._lazyimport import (
 )
 
 if TYPE_CHECKING or not install_lazy_importer():
+    from ._core._ack_queue import create_ack_queue as create_ack_queue
     from ._core._concurrency_utils import amap as amap
     from ._core._concurrency_utils import as_completed as as_completed
     from ._core._concurrency_utils import gather as gather
@@ -31,6 +32,9 @@ if TYPE_CHECKING or not install_lazy_importer():
     from ._core._exceptions import ClosedResourceError as ClosedResourceError
     from ._core._exceptions import ConnectionFailed as ConnectionFailed
     from ._core._exceptions import DelimiterNotFound as DelimiterNotFound
+    from ._core._exceptions import (
+        DuplicateAcknowledgeError as DuplicateAcknowledgeError,
+    )
     from ._core._exceptions import EndOfStream as EndOfStream
     from ._core._exceptions import FutureAlreadyFinished as FutureAlreadyFinished
     from ._core._exceptions import FutureCancelled as FutureCancelled

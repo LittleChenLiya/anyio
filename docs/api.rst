@@ -112,6 +112,7 @@ Streams and stream wrappers
 ---------------------------
 
 .. autofunction:: anyio.create_memory_object_stream
+.. autofunction:: anyio.create_ack_queue
 
 .. autoclass:: anyio.abc.UnreliableObjectReceiveStream()
 .. autoclass:: anyio.abc.UnreliableObjectSendStream()
@@ -142,6 +143,10 @@ Streams and stream wrappers
 .. autoclass:: anyio.streams.memory.MemoryObjectReceiveStream
 .. autoclass:: anyio.streams.memory.MemoryObjectSendStream
 .. autoclass:: anyio.streams.memory.MemoryObjectStreamStatistics
+.. autoclass:: anyio.streams.ack_queue.AckQueueReceiveStream
+.. autoclass:: anyio.streams.ack_queue.AckQueueSendStream
+.. autoclass:: anyio.streams.ack_queue.MessageAcknowledgeHandle
+.. autoclass:: anyio.streams.ack_queue.AckQueueStatistics
 .. autoclass:: anyio.streams.stapled.MultiListener
 .. autoclass:: anyio.streams.stapled.StapledByteStream
 .. autoclass:: anyio.streams.stapled.StapledObjectStream
@@ -278,6 +283,7 @@ Exceptions
 .. autoexception:: anyio.ClosedResourceError
 .. autoexception:: anyio.ConnectionFailed
 .. autoexception:: anyio.DelimiterNotFound
+.. autoexception:: anyio.DuplicateAcknowledgeError
 .. autoexception:: anyio.EndOfStream
 .. autoexception:: anyio.FutureAlreadyFinished
 .. autoexception:: anyio.FutureCancelled

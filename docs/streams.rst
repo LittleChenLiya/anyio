@@ -131,6 +131,53 @@ stream as a context manager::
         with send_stream:
             send_stream.send_nowait('hello')
 
+Acknowledgement queues
+----------------------
+
+Sometimes a producer needs to know not only that a message was handed to a consumer,
+but that the consumer actually finished processing it. For this, AnyIO provides
+:func:`~anyio.create_ack_queue`, an independent component built alongside memory
+object streams that does not change their default semantics.
+
+Like a memory object stream, the queue has a bounded capacity, can be cloned at
+either end, and delivers messages to a single recipient. Unlike a memory object
+stream, receiving returns an ``(item, handle)`` pair. The consumer calls
+:meth:`~.streams.ack_queue.MessageAcknowledgeHandle.acknowledge` once processing has
+succeeded. Acknowledging the same handle twice raises
+:exc:`~anyio.DuplicateAcknowledgeError`. The producer can call
+:meth:`~.streams.ack_queue.AckQueueSendStream.join` to wait until every admitted
+message has been acknowledged.
+
+The capacity counts both queued messages and messages that have been delivered but
+not yet acknowledged, so a full queue stays full until processing completes. If a
+consumer is cancelled after receiving a message, or explicitly returns it with
+:meth:`~.streams.ack_queue.MessageAcknowledgeHandle.requeue`, the message is put
+back at the front of the pending queue, keeps its original sequence number, and is
+redelivered ahead of any newer messages. Closing the send end still lets consumers
+drain the remaining messages; when the last receive clone is closed, blocked
+senders and joiners are woken with :exc:`~anyio.BrokenResourceError`.
+
+Example::
+
+    from anyio import create_ack_queue, create_task_group, run
+
+
+    async def main() -> None:
+        send, receive = create_ack_queue[str](2)
+        async with create_task_group() as tg:
+            tg.start_soon(send.send, "hello")
+            tg.start_soon(send.send, "anyio")
+
+            for _ in range(2):
+                item, handle = await receive.receive()
+                print("processing", item)
+                handle.acknowledge()
+
+            await send.join()  # returns once all messages have been processed
+
+
+    run(main)
+
 Stapled streams
 ---------------
 
