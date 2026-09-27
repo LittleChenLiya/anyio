@@ -144,6 +144,64 @@ It comes in two variants:
 * :class:`~.streams.stapled.StapledObjectStream` (combines an
   :class:`~.abc.ObjectReceiveStream` with a compatible :class:`~.abc.ObjectSendStream`)
 
+Acknowledgeable queues
+----------------------
+
+Sometimes merely receiving a message is not enough: the sender wants to wait until
+the consumer has actually *finished processing* a batch of messages. The
+:func:`~anyio.create_ack_queue` function builds an independent component for this on
+top of the same synchronization primitives as the memory object streams. It does not
+change the behavior of :func:`~create_memory_object_stream` in any way.
+
+Receiving from the queue yields an :class:`~anyio.streams.ackqueue.AckQueueDelivery`
+named tuple containing the message and an :class:`~anyio.streams.ackqueue.AckHandle`:
+
+* Call :meth:`~anyio.streams.ackqueue.AckHandle.acknowledge` after the message has
+  been successfully processed. This releases its capacity slot and allows
+  :meth:`~anyio.streams.ackqueue.AckQueueSendStream.send` to make progress.
+* Acknowledging the same delivery twice (or acknowledging after rejecting it) raises
+  :class:`~anyio.AlreadyAcknowledgedError`.
+* Capacity counts both messages still waiting in the queue *and* messages that have
+  been handed out but not yet acknowledged.
+* :meth:`~anyio.streams.ackqueue.AckQueueSendStream.join` blocks until the number of
+  unacknowledged messages (buffered plus in flight) reaches zero.
+* If the consumer is cancelled before acknowledging, or calls
+  :meth:`~anyio.streams.ackqueue.AckHandle.reject`, the same message is put back at
+  the head of the queue and redelivered before any newer messages.
+* After the sending end is closed, consumers can still drain and acknowledge the
+  remaining messages. When the *last* receive stream is closed, blocked senders and
+  joiners are woken up with :class:`~anyio.BrokenResourceError`.
+
+The easiest way to get automatic redelivery on cancellation is the
+:meth:`~anyio.streams.ackqueue.AckQueueReceiveStream.process` async context manager::
+
+    from anyio import create_ack_queue, run
+
+
+    async def main():
+        send, receive = create_ack_queue[str](2)
+        with send, receive:
+            await send.send("hello")
+            async with receive.process() as delivery:
+                print("processing", delivery.item)
+                delivery.ack.acknowledge()
+
+            await send.join()
+
+    run(main)
+
+If the ``async with`` block is cancelled (or raises an exception) before the message
+is acknowledged, the message is returned to the queue. You can also work with
+:meth:`~anyio.streams.ackqueue.AckQueueReceiveStream.receive` directly; a handle that
+is discarded without being settled causes the message to be returned when it is
+garbage collected, and :meth:`~anyio.streams.ackqueue.AckHandle.reject` returns it
+explicitly. Every redelivery hands out a fresh handle, and the old handle can no
+longer acknowledge the message.
+
+A runnable example demonstrating both normal acknowledgement with backpressure and
+cancellation-based redelivery is available in ``examples/ack_queue_demo.py``.
+
+
 Buffered byte streams
 ---------------------
 

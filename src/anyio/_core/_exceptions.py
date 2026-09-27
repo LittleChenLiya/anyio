@@ -203,3 +203,17 @@ class FutureAlreadyFinished(Exception):
     Raised when attempting set a result of or await a
     :class:`.Future` that has already completed.
     """
+
+
+class AcknowledgementError(Exception):
+    """Base class for errors related to acknowledging queue deliveries."""
+
+
+class AlreadyAcknowledgedError(AcknowledgementError):
+    """
+    Raised when a delivery is acknowledged or rejected more than once.
+
+    This also applies when acknowledging a delivery whose message has already been
+    returned to the queue because the corresponding acknowledgeable queue handle
+    was abandoned (for example, because the consumer task was cancelled).
+    """

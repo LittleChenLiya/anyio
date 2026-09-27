@@ -113,6 +113,8 @@ Streams and stream wrappers
 
 .. autofunction:: anyio.create_memory_object_stream
 
+.. autofunction:: anyio.create_ack_queue
+
 .. autoclass:: anyio.abc.UnreliableObjectReceiveStream()
 .. autoclass:: anyio.abc.UnreliableObjectSendStream()
 .. autoclass:: anyio.abc.UnreliableObjectStream()
@@ -142,6 +144,13 @@ Streams and stream wrappers
 .. autoclass:: anyio.streams.memory.MemoryObjectReceiveStream
 .. autoclass:: anyio.streams.memory.MemoryObjectSendStream
 .. autoclass:: anyio.streams.memory.MemoryObjectStreamStatistics
+.. autoclass:: anyio.streams.ackqueue.AckHandle()
+.. autoclass:: anyio.streams.ackqueue.AckQueueDelivery()
+.. autoclass:: anyio.streams.ackqueue.MessageProcess()
+.. autoclass:: anyio.streams.ackqueue.AckQueueReceiveStream
+.. autoclass:: anyio.streams.ackqueue.AckQueueSendStream
+.. autoclass:: anyio.streams.ackqueue.AckQueueStatistics
+.. autoclass:: anyio.AlreadyAcknowledgedError
 .. autoclass:: anyio.streams.stapled.MultiListener
 .. autoclass:: anyio.streams.stapled.StapledByteStream
 .. autoclass:: anyio.streams.stapled.StapledObjectStream

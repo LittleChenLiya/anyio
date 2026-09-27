@@ -5,6 +5,12 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added ``create_ack_queue()``, an acknowledgeable in-memory queue: receiving
+  yields a message and an acknowledgement handle, unacknowledged (cancelled or
+  rejected) messages are redelivered at the head of the queue, capacity counts
+  both queued and in-flight messages, and ``join()`` waits for all messages to be
+  acknowledged; the default semantics of memory object streams are unchanged
+  (`#1335 <https://github.com/agronholm/anyio/pull/1335>`_)
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends

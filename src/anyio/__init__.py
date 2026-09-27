@@ -9,6 +9,7 @@ from ._lazyimport import (
 )
 
 if TYPE_CHECKING or not install_lazy_importer():
+    from ._core._ackqueue import create_ack_queue as create_ack_queue
     from ._core._concurrency_utils import amap as amap
     from ._core._concurrency_utils import as_completed as as_completed
     from ._core._concurrency_utils import gather as gather
@@ -24,6 +25,8 @@ if TYPE_CHECKING or not install_lazy_importer():
     from ._core._eventloop import sleep as sleep
     from ._core._eventloop import sleep_forever as sleep_forever
     from ._core._eventloop import sleep_until as sleep_until
+    from ._core._exceptions import AcknowledgementError as AcknowledgementError
+    from ._core._exceptions import AlreadyAcknowledgedError as AlreadyAcknowledgedError
     from ._core._exceptions import BrokenResourceError as BrokenResourceError
     from ._core._exceptions import BrokenWorkerInterpreter as BrokenWorkerInterpreter
     from ._core._exceptions import BrokenWorkerProcess as BrokenWorkerProcess
@@ -119,6 +122,14 @@ if TYPE_CHECKING or not install_lazy_importer():
     from ._core._typedattr import TypedAttributeProvider as TypedAttributeProvider
     from ._core._typedattr import TypedAttributeSet as TypedAttributeSet
     from ._core._typedattr import typed_attribute as typed_attribute
+    from .streams.ackqueue import AckHandle as AckHandle
+    from .streams.ackqueue import AckQueueDelivery as AckQueueDelivery
+    from .streams.ackqueue import (
+        AckQueueReceiveStream as AckQueueReceiveStream,
+    )
+    from .streams.ackqueue import AckQueueSendStream as AckQueueSendStream
+    from .streams.ackqueue import AckQueueStatistics as AckQueueStatistics
+    from .streams.ackqueue import MessageProcess as MessageProcess
 
     # ruff: isort: off
     from . import (
