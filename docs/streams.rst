@@ -131,6 +131,66 @@ stream as a context manager::
         with send_stream:
             send_stream.send_nowait('hello')
 
+Broadcast object streams
+------------------------
+
+Memory object streams distribute each item to a single consumer. When you instead
+need every consumer to receive its own copy of each published item, use a broadcast
+object stream::
+
+    from anyio import create_broadcast_object_stream, create_task_group, run
+
+
+    async def subscriber(name: str, receive_stream) -> None:
+        async with receive_stream:
+            async for item in receive_stream:
+                print(f"{name} received {item!r}")
+
+
+    async def main() -> None:
+        publish_stream = create_broadcast_object_stream[str]()
+        async with create_task_group() as tg:
+            tg.start_soon(subscriber, "A", publish_stream.subscribe(10))
+            tg.start_soon(subscriber, "B", publish_stream.subscribe(10))
+            await publish_stream.publish("hello")
+            await publish_stream.publish("world")
+            publish_stream.close()
+
+
+    run(main)
+
+Only the send side is returned by :func:`create_broadcast_object_stream`.
+Subscribers are added dynamically with the ``subscribe()`` method, which takes a
+positive integer capacity for that subscription's own, independent buffer.
+
+Delivery and buffering semantics:
+
+* Each live subscription receives every item published after the subscription was
+  created. Items published earlier are never delivered to it.
+* A subscription is live until all of its receive clones have been closed.
+* A successful ``publish()`` has a single linearization point: a synchronous,
+  uninterruptible section that first verifies that every live subscription has a
+  free buffer slot and then appends the item to every subscription buffer. The
+  broadcast is therefore all-or-nothing: the item is delivered to every live
+  subscription or to none of them.
+* If any live subscription buffer is full, ``publish()`` blocks until every live
+  subscription again has room. Cancelling a blocked ``publish()`` guarantees that no
+  subscription receives the item -- there is no such thing as a half-finished
+  broadcast.
+* Closing a subscription wakes up publishers waiting on it. Publishers then
+  re-check the remaining live subscriptions; publishing with zero live
+  subscriptions raises :exc:`~BrokenResourceError`.
+* Once all clones of the send stream have been closed, each subscriber first
+  drains the items already enqueued in its own buffer and then receives
+  :class:`~EndOfStream`.
+
+
+The ``clone()`` method on a subscription shares the existing subscription, including
+its buffer and capacity; it does not add a new subscriber. Clones of one
+subscription distribute items among themselves just like memory object stream
+clones. To add another subscriber that independently receives every item, call
+``subscribe()`` again.
+
 Stapled streams
 ---------------
 

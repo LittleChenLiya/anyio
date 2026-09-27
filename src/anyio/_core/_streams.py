@@ -4,6 +4,10 @@ import math
 from typing import TypeVar
 from warnings import warn
 
+from ..streams.broadcast import (
+    BroadcastObjectSendStream,
+    _BroadcastState,
+)
 from ..streams.memory import (
     MemoryObjectReceiveStream,
     MemoryObjectSendStream,
@@ -50,3 +54,26 @@ class create_memory_object_stream(
 
         state = _MemoryObjectStreamState[T_Item](max_buffer_size)
         return (MemoryObjectSendStream(state), MemoryObjectReceiveStream(state))
+
+
+class create_broadcast_object_stream(BroadcastObjectSendStream[T_Item]):
+    """
+    Create a broadcast object stream.
+
+    Unlike :func:`create_memory_object_stream`, only a send side is returned.
+    Subscribers are added dynamically with
+    :meth:`~anyio.streams.broadcast.BroadcastObjectSendStream.subscribe`, each
+    receiving its own independent, bounded buffer. Every item published on the
+    send stream is delivered to every live subscription (not distributed
+    between them).
+
+    The stream's item type can be annotated like
+    ``create_broadcast_object_stream[T_Item]``.
+
+    :return: the broadcast send stream
+
+    """
+
+    def __new__(cls) -> BroadcastObjectSendStream[T_Item]:  # type: ignore[misc]
+        state = _BroadcastState[T_Item]()
+        return BroadcastObjectSendStream(state)

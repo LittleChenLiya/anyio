@@ -5,6 +5,12 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added ``create_broadcast_object_stream()`` which provides a
+  ``BroadcastObjectSendStream`` with independent, per-subscription bounded
+  buffers; each ``subscribe()`` call receives every item published after it was
+  created, blocked publishes are all-or-nothing under cancellation and
+  subscribers drain their buffers before receiving ``EndOfStream`` once the
+  send side is closed
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends

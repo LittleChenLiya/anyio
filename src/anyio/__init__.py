@@ -78,6 +78,9 @@ if TYPE_CHECKING or not install_lazy_importer():
     from ._core._sockets import wait_socket_writable as wait_socket_writable
     from ._core._sockets import wait_writable as wait_writable
     from ._core._streams import (
+        create_broadcast_object_stream as create_broadcast_object_stream,
+    )
+    from ._core._streams import (
         create_memory_object_stream as create_memory_object_stream,
     )
     from ._core._subprocesses import open_process as open_process
