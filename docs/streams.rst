@@ -179,6 +179,38 @@ The above script gives the following output::
 .. tip:: In some cases, you may need to inject data directly into the buffer. You can do
     that with the :meth:`~.streams.buffered.BufferedByteReceiveStream.feed_data` method.
 
+Rate limited byte streams
+-------------------------
+
+A rate limited byte stream wraps an existing bytes-oriented receive stream and limits
+the rate at which bytes are handed to the caller. The limiter works like a token
+bucket: a token (representing one byte) accumulates at the given ``rate`` (in bytes
+per second), up to a maximum burst allowance of ``burst_bytes``. Bytes in excess of
+the current allowance are kept in a bounded buffer and delivered by later reads.
+
+Example::
+
+    from anyio import run, create_memory_object_stream
+    from anyio.streams.ratelimit import RateLimitedByteReceiveStream
+
+
+    async def main():
+        send, receive = create_memory_object_stream[bytes](4)
+        # Allow at most 1024 bytes per second, in bursts of up to 100 bytes
+        limited = RateLimitedByteReceiveStream(
+            receive, rate=1024, burst_bytes=100
+        )
+        await send.send(b'x' * 1000)
+
+        chunk = await limited.receive()
+        print(len(chunk))
+
+    run(main)
+
+The above script starts by delivering the full 100 byte burst::
+
+    100
+
 Text streams
 ------------
 

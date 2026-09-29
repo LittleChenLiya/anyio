@@ -136,6 +136,7 @@ Streams and stream wrappers
 
 .. autoclass:: anyio.streams.buffered.BufferedByteReceiveStream
 .. autoclass:: anyio.streams.buffered.BufferedByteStream
+.. autoclass:: anyio.streams.ratelimit.RateLimitedByteReceiveStream
 .. autoclass:: anyio.streams.file.FileStreamAttribute
 .. autoclass:: anyio.streams.file.FileReadStream
 .. autoclass:: anyio.streams.file.FileWriteStream

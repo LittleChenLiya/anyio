@@ -5,6 +5,10 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added ``RateLimitedByteReceiveStream``, a reusable ``ByteReceiveStream`` wrapper
+  that throttles the rate at which bytes are delivered to the caller using a
+  token bucket with a caller-specified rate and burst size, buffering any surplus
+  bytes from the wrapped stream in a bounded buffer
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends
