@@ -5,6 +5,10 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added the ``RateLimitedByteReceiveStream`` class
+  (``anyio.streams.ratelimit``) which wraps a byte receive stream and limits the
+  rate at which bytes are delivered, using a token bucket algorithm with a
+  configurable rate and burst size
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends
