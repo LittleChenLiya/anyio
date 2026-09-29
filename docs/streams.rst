@@ -131,6 +131,73 @@ stream as a context manager::
         with send_stream:
             send_stream.send_nowait('hello')
 
+.. _broadcast streams:
+
+Broadcast streams
+-----------------
+
+Broadcast streams implement the publisher-subscriber pattern. Unlike memory object
+streams, where each item is delivered to exactly one consumer, a
+:class:`~.streams.broadcast.BroadcastStream` fans out every published item so that
+**every** subscription receives its own copy of every item published after the
+subscription was created.
+
+A broadcast stream has three fundamental operations:
+
+* :meth:`~.streams.broadcast.BroadcastStream.subscribe` creates a new subscription
+  and returns its receive stream
+* :meth:`~.streams.broadcast.BroadcastStream.publish` delivers an item to all live
+  subscriptions
+* :meth:`~.streams.broadcast.BroadcastStream.close` closes the publishing end
+
+Each subscription has its own independent buffer with a positive integer capacity,
+chosen when subscribing. Publishing first checks that **all** live subscriptions
+have room for the item, and only then delivers it to all of them in a single
+synchronous step. That step is the linearization point of a successful publish: no
+task can ever observe the item in some subscription buffers but not others. If any
+subscription's buffer is full, the publisher waits until every live subscription
+has room again. If the publish is cancelled while waiting, the item is guaranteed
+to not have been delivered to any subscription – there is never a partial
+broadcast.
+
+Publishing when there are no live subscriptions succeeds immediately and the item
+is discarded, since subscriptions only receive items published after they were
+created.
+
+Closing a subscription (via
+:meth:`~.streams.broadcast.BroadcastReceiveStream.close`) removes it from the
+broadcast stream: publishers stop waiting for it, any items still buffered for it
+are discarded, and tasks blocked on
+:meth:`~.streams.broadcast.BroadcastStream.publish` are woken so they can
+re-evaluate the remaining subscriptions. Closing the broadcast stream itself
+prevents any further publishing and subscribing; each subscription keeps its
+buffered items, so receivers first drain what was already published to them and
+only then get :exc:`~EndOfStream`.
+
+Receive streams can be cloned with
+:meth:`~.streams.broadcast.BroadcastReceiveStream.clone`, but note that the clone
+is a **new, independent subscription** (with the same buffer capacity), not a
+shared view of the original subscription. It only receives items published after
+the clone was created.
+
+Stapled streams
+Example::
+
+    from anyio import run
+    from anyio.streams.broadcast import BroadcastStream
+
+
+    async def main() -> None:
+        async with BroadcastStream[str]() as broadcast:
+            async with broadcast.subscribe(2) as subscriber_a:
+                async with broadcast.subscribe(2) as subscriber_b:
+                    await broadcast.publish("hello")
+                    print("A received", await subscriber_a.receive())
+                    print("B received", await subscriber_b.receive())
+
+
+    run(main)
+
 Stapled streams
 ---------------
 
