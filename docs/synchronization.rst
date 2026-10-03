@@ -226,6 +226,60 @@ Example::
     # Task number 8 is now working with the shared resource
     # Task number 9 is now working with the shared resource
 
+Sealing capacity limiters
+-------------------------
+
+A :class:`SealedCapacityLimiter` wraps a :class:`CapacityLimiter` and adds the
+ability to seal it. Once sealed, new acquire attempts are rejected immediately
+with :class:`CapacityLimiterSealed`, while tasks that already hold a token may
+finish normally. Tasks that were queued up waiting for a token when the limiter
+was sealed are woken up and rejected as well. The :meth:`~SealedCapacityLimiter.wait_drained`
+method lets you wait until every borrowed token has been released::
+
+    from anyio import (
+        CapacityLimiter,
+        CapacityLimiterSealed,
+        Event,
+        SealedCapacityLimiter,
+        create_task_group,
+        run,
+        wait_all_tasks_blocked,
+    )
+
+
+    async def hold_token(limiter, name, release):
+        try:
+            async with limiter:
+                print(f"{name} acquired a token")
+                await release.wait()
+        except CapacityLimiterSealed:
+            print(f"{name} was rejected (limiter sealed)")
+
+
+    async def main():
+        limiter = SealedCapacityLimiter(CapacityLimiter(1))
+        release = Event()
+        async with create_task_group() as tg:
+            tg.start_soon(hold_token, limiter, "holder", release)
+            await wait_all_tasks_blocked()
+            tg.start_soon(hold_token, limiter, "waiter1", release)
+            tg.start_soon(hold_token, limiter, "waiter2", release)
+            await wait_all_tasks_blocked()
+            print(limiter.statistics())
+            limiter.seal()
+            release.set()
+            await wait_all_tasks_blocked()
+            print(limiter.statistics())
+
+    run(main)
+
+    # Output:
+    # holder acquired a token
+    # SealedCapacityLimiterStatistics(sealed=False, borrowed_tokens=1, total_tokens=1, borrowers=(...), tasks_waiting=2, tasks_draining=0)
+    # waiter1 was rejected (limiter sealed)
+    # waiter2 was rejected (limiter sealed)
+    # SealedCapacityLimiterStatistics(sealed=True, borrowed_tokens=0, total_tokens=1, borrowers=(), tasks_waiting=0, tasks_draining=0)
+
 Resource guards
 ---------------
 

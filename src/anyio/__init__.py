@@ -86,6 +86,15 @@ if TYPE_CHECKING or not install_lazy_importer():
     from ._core._synchronization import (
         CapacityLimiterStatistics as CapacityLimiterStatistics,
     )
+    from ._core._sealed_capacity_limiter import (
+        CapacityLimiterSealed as CapacityLimiterSealed,
+    )
+    from ._core._sealed_capacity_limiter import (
+        SealedCapacityLimiter as SealedCapacityLimiter,
+    )
+    from ._core._sealed_capacity_limiter import (
+        SealedCapacityLimiterStatistics as SealedCapacityLimiterStatistics,
+    )
     from ._core._synchronization import Condition as Condition
     from ._core._synchronization import ConditionStatistics as ConditionStatistics
     from ._core._synchronization import Event as Event

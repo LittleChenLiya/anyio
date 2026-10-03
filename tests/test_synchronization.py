@@ -10,9 +10,12 @@ import pytest
 from anyio import (
     CancelScope,
     CapacityLimiter,
+    CapacityLimiterSealed,
     Condition,
     Event,
     Lock,
+    SealedCapacityLimiter,
+    SealedCapacityLimiterStatistics,
     Semaphore,
     WouldBlock,
     create_task_group,
@@ -1061,3 +1064,271 @@ class TestCapacityLimiter:
         assert limiter.available_tokens >= 0
         assert limiter.statistics().borrowers == ("B",)
         limiter.release_on_behalf_of("B")
+
+
+class TestSealedCapacityLimiter:
+    async def test_basic_acquire_release(self) -> None:
+        limiter = SealedCapacityLimiter(CapacityLimiter(1))
+        assert not limiter.sealed
+        assert limiter.borrowed_tokens == 0
+        async with limiter:
+            assert limiter.borrowed_tokens == 1
+            assert limiter.available_tokens == 0
+
+        assert limiter.borrowed_tokens == 0
+        assert limiter.available_tokens == 1
+
+    async def test_seal_rejects_new_acquire(self) -> None:
+        limiter = SealedCapacityLimiter(CapacityLimiter(1))
+        await limiter.acquire()
+        limiter.seal()
+        assert limiter.sealed
+
+        with pytest.raises(CapacityLimiterSealed):
+            await limiter.acquire()
+
+        with pytest.raises(CapacityLimiterSealed):
+            limiter.acquire_nowait()
+
+        with pytest.raises(CapacityLimiterSealed):
+            await limiter.acquire_on_behalf_of(object())
+
+        with pytest.raises(CapacityLimiterSealed):
+            limiter.acquire_on_behalf_of_nowait(object())
+
+        limiter.release()
+
+    async def test_seal_is_idempotent(self) -> None:
+        limiter = SealedCapacityLimiter(CapacityLimiter(1))
+        limiter.seal()
+        limiter.seal()
+        assert limiter.sealed
+
+    async def test_queued_waiters_rejected_on_seal(self) -> None:
+        limiter = SealedCapacityLimiter(CapacityLimiter(1))
+        await limiter.acquire()  # hold the only token
+        results: list[str] = []
+
+        async def waiter(name: str) -> None:
+            try:
+                await limiter.acquire()
+                results.append(f"{name}:granted")
+            except CapacityLimiterSealed:
+                results.append(f"{name}:rejected")
+
+        async with create_task_group() as tg:
+            tg.start_soon(waiter, "w1")
+            tg.start_soon(waiter, "w2")
+            await wait_all_tasks_blocked()
+            assert limiter.statistics().tasks_waiting == 2
+            limiter.seal()
+            await wait_all_tasks_blocked()
+
+        assert sorted(results) == ["w1:rejected", "w2:rejected"]
+        assert limiter.borrowed_tokens == 1
+        limiter.release()
+
+    async def test_wait_drained_completes_after_release(self) -> None:
+        limiter = SealedCapacityLimiter(CapacityLimiter(1))
+        await limiter.acquire()
+        drained = Event()
+
+        async def drainer() -> None:
+            await limiter.wait_drained()
+            drained.set()
+
+        async with create_task_group() as tg:
+            tg.start_soon(drainer)
+            await wait_all_tasks_blocked()
+            assert not drained.is_set()
+            assert limiter.statistics().tasks_draining == 1
+            limiter.release()
+            await wait_all_tasks_blocked()
+            assert drained.is_set()
+
+        assert limiter.borrowed_tokens == 0
+
+    async def test_wait_drained_returns_immediately_when_empty(self) -> None:
+        limiter = SealedCapacityLimiter(CapacityLimiter(1))
+        await limiter.wait_drained()
+        assert limiter.borrowed_tokens == 0
+
+    async def test_cancel_waiting_acquirer_does_not_release_others(self) -> None:
+        limiter = SealedCapacityLimiter(CapacityLimiter(2))
+        borrower1, borrower2 = object(), object()
+        limiter.acquire_on_behalf_of_nowait(borrower1)
+        limiter.acquire_on_behalf_of_nowait(borrower2)
+        assert limiter.borrowed_tokens == 2
+
+        async def waiter() -> None:
+            await limiter.acquire()
+
+        async with create_task_group():
+            async with create_task_group() as waiter_tg:
+                waiter_tg.start_soon(waiter)
+                await wait_all_tasks_blocked()
+                assert limiter.statistics().tasks_waiting == 1
+                waiter_tg.cancel_scope.cancel()
+
+            # The waiter was cancelled; the borrowers still hold their tokens
+            assert limiter.borrowed_tokens == 2
+
+        limiter.release_on_behalf_of(borrower1)
+        assert limiter.borrowed_tokens == 1
+        limiter.release_on_behalf_of(borrower2)
+        assert limiter.borrowed_tokens == 0
+
+    async def test_cancel_drain_waiter_keeps_borrower_token(self) -> None:
+        limiter = SealedCapacityLimiter(CapacityLimiter(1))
+        await limiter.acquire()  # borrower holds 1 token
+        drain_started = Event()
+
+        async def drainer() -> None:
+            drain_started.set()
+            await limiter.wait_drained()
+
+        async with create_task_group() as tg:
+            tg.start_soon(drainer)
+            await drain_started.wait()
+            await wait_all_tasks_blocked()
+            assert limiter.statistics().tasks_draining == 1
+            tg.cancel_scope.cancel()
+
+        # The borrower still holds the token
+        assert limiter.borrowed_tokens == 1
+        assert len(limiter.statistics().borrowers) == 1
+        limiter.release()
+        assert limiter.borrowed_tokens == 0
+
+    async def test_seal_acquire_race_has_single_outcome(self) -> None:
+        limiter = SealedCapacityLimiter(CapacityLimiter(1))
+        holder = object()
+        limiter.acquire_on_behalf_of_nowait(holder)
+
+        seal_started = Event()
+        acquire_started = Event()
+        outcomes: list[str] = []
+
+        async def seal_task() -> None:
+            seal_started.set()
+            await acquire_started.wait()
+            limiter.seal()
+            outcomes.append("sealed")
+
+        async def acquire_task() -> None:
+            acquire_started.set()
+            await seal_started.wait()
+            try:
+                await limiter.acquire()
+                outcomes.append("acquired")
+            except CapacityLimiterSealed:
+                outcomes.append("rejected")
+
+        async with create_task_group() as tg:
+            tg.start_soon(seal_task)
+            tg.start_soon(acquire_task)
+            await wait_all_tasks_blocked()
+
+        assert sorted(outcomes) == ["rejected", "sealed"]
+        limiter.release_on_behalf_of(holder)
+
+    async def test_statistics(self) -> None:
+        limiter = SealedCapacityLimiter(CapacityLimiter(2))
+        stats = limiter.statistics()
+        assert isinstance(stats, SealedCapacityLimiterStatistics)
+        assert stats.sealed is False
+        assert stats.borrowed_tokens == 0
+        assert stats.total_tokens == 2
+        assert stats.borrowers == ()
+        assert stats.tasks_waiting == 0
+        assert stats.tasks_draining == 0
+
+        borrower1, borrower2 = object(), object()
+        limiter.acquire_on_behalf_of_nowait(borrower1)
+        limiter.acquire_on_behalf_of_nowait(borrower2)
+        limiter.seal()
+        stats = limiter.statistics()
+        assert stats.sealed is True
+        assert stats.borrowed_tokens == 2
+        assert stats.total_tokens == 2
+        assert len(stats.borrowers) == 2
+        assert stats.tasks_waiting == 0
+        assert stats.tasks_draining == 0
+        limiter.release_on_behalf_of(borrower1)
+        limiter.release_on_behalf_of(borrower2)
+
+    async def test_increase_total_tokens_grants_waiters(self) -> None:
+        limiter = SealedCapacityLimiter(CapacityLimiter(1))
+        holder = object()
+        limiter.acquire_on_behalf_of_nowait(holder)
+        acquired = Event()
+
+        async def waiter() -> None:
+            await limiter.acquire()
+            acquired.set()
+
+        async with create_task_group() as tg:
+            tg.start_soon(waiter)
+            await wait_all_tasks_blocked()
+            assert not acquired.is_set()
+            limiter.total_tokens = 2
+            await wait_all_tasks_blocked()
+            assert acquired.is_set()
+
+        assert limiter.borrowed_tokens == 2
+        limiter.release_on_behalf_of(holder)
+
+    async def test_acquire_on_behalf_of(self) -> None:
+        limiter = SealedCapacityLimiter(CapacityLimiter(1))
+        borrower = object()
+        await limiter.acquire_on_behalf_of(borrower)
+        assert limiter.borrowed_tokens == 1
+        with pytest.raises(RuntimeError):
+            await limiter.acquire_on_behalf_of(borrower)
+
+        limiter.release_on_behalf_of(borrower)
+        assert limiter.borrowed_tokens == 0
+
+    async def test_acquire_on_behalf_of_nowait(self) -> None:
+        limiter = SealedCapacityLimiter(CapacityLimiter(1))
+        borrower = object()
+        limiter.acquire_on_behalf_of_nowait(borrower)
+        assert limiter.borrowed_tokens == 1
+        with pytest.raises(WouldBlock):
+            limiter.acquire_on_behalf_of_nowait(object())
+
+        limiter.release_on_behalf_of(borrower)
+
+    async def test_release_without_acquire_raises(self) -> None:
+        limiter = SealedCapacityLimiter(CapacityLimiter(1))
+        with pytest.raises(RuntimeError):
+            limiter.release()
+
+    async def test_sealed_limiter_rejects_nowait_even_with_free_tokens(self) -> None:
+        limiter = SealedCapacityLimiter(CapacityLimiter(2))
+        limiter.seal()
+        # Even though tokens are free, acquire is rejected
+        assert limiter.available_tokens == 2
+        with pytest.raises(CapacityLimiterSealed):
+            limiter.acquire_nowait()
+
+    async def test_drain_waiters_notified_on_release(self) -> None:
+        limiter = SealedCapacityLimiter(CapacityLimiter(1))
+        holder = object()
+        limiter.acquire_on_behalf_of_nowait(holder)
+        results: list[str] = []
+
+        async def drainer(name: str) -> None:
+            await limiter.wait_drained()
+            results.append(name)
+
+        async with create_task_group() as tg:
+            tg.start_soon(drainer, "d1")
+            tg.start_soon(drainer, "d2")
+            await wait_all_tasks_blocked()
+            assert limiter.statistics().tasks_draining == 2
+            limiter.release_on_behalf_of(holder)
+            await wait_all_tasks_blocked()
+
+        assert sorted(results) == ["d1", "d2"]
+        assert limiter.borrowed_tokens == 0
