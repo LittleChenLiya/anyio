@@ -400,3 +400,55 @@ that is expected to skip the TLS closing handshake, you need to pass the
 .. _TLS standard: https://tools.ietf.org/html/draft-ietf-tls-tls13-28
 .. _truncation attacks: https://en.wikipedia.org/wiki/Transport_Layer_Security
    #Attacks_against_TLS/SSL
+
+Streaming to a transactional sink
+----------------------------------
+
+A *transactional sink* is a byte sink that does not publish the data it receives until
+:meth:`~.abc.TransactionalByteSink.commit` is called. If the transfer fails or is
+cancelled before commit, :meth:`~.abc.TransactionalByteSink.abort` discards the data.
+AnyIO provides the :func:`~.streams.transfer.transfer_stream` utility to stream bytes
+from a single :class:`~.abc.ByteReceiveStream` to such a sink while verifying the
+content.
+
+The utility reads the source chunk by chunk, writes each chunk to the sink as it is
+received, and computes a SHA-256 digest on the fly -- the entire content is never
+buffered. The sink is only committed when all of the following hold:
+
+* the source reaches EOF,
+* the total number of bytes does not exceed ``max_bytes``, and
+* the computed digest matches ``expected_digest``.
+
+On any failure before commit (including cancellation), the sink is aborted first and
+the original error is then re-raised. A failure raised by the sink's own ``abort()`` is
+suppressed so that it cannot mask the original error. If the sink's ``commit()`` fails,
+the error is propagated as-is -- the transaction state is owned by the sink, so the
+utility neither aborts nor claims success.
+
+No background tasks are created; the entire transfer runs in the calling task.
+
+The source stream is not closed by default. Pass ``close_source=True`` to close it
+after the transfer (at most once), regardless of whether it succeeded or failed.
+
+Example::
+
+    import hashlib
+
+    from anyio import run
+    from anyio.streams.transfer import transfer_stream
+
+
+    async def main():
+        digest = hashlib.sha256(b"abc").hexdigest()
+        await transfer_stream(
+            source,
+            sink,
+            expected_digest=digest,
+            max_bytes=1024,
+        )
+
+
+    run(main)
+
+A runnable demo that prints the commit and abort counts is available in the
+``examples/transfer_demo.py`` file of the source distribution.

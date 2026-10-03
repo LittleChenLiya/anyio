@@ -41,6 +41,7 @@ if TYPE_CHECKING or not install_lazy_importer():
     from ._streams import ObjectSendStream as ObjectSendStream
     from ._streams import ObjectStream as ObjectStream
     from ._streams import ObjectStreamConnectable as ObjectStreamConnectable
+    from ._streams import TransactionalByteSink as TransactionalByteSink
     from ._streams import UnreliableObjectReceiveStream as UnreliableObjectReceiveStream
     from ._streams import UnreliableObjectSendStream as UnreliableObjectSendStream
     from ._streams import UnreliableObjectStream as UnreliableObjectStream

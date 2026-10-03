@@ -122,6 +122,7 @@ Streams and stream wrappers
 .. autoclass:: anyio.abc.ByteReceiveStream
 .. autoclass:: anyio.abc.ByteSendStream
 .. autoclass:: anyio.abc.ByteStream
+.. autoclass:: anyio.abc.TransactionalByteSink
 .. autoclass:: anyio.abc.Listener
 .. autoclass:: anyio.abc.ObjectStreamConnectable
 .. autoclass:: anyio.abc.ByteStreamConnectable
@@ -153,6 +154,8 @@ Streams and stream wrappers
 .. autoclass:: anyio.streams.tls.TLSStream
 .. autoclass:: anyio.streams.tls.TLSListener
 .. autoclass:: anyio.streams.tls.TLSConnectable
+
+.. autofunction:: anyio.streams.transfer.transfer_stream
 
 Sockets and networking
 ----------------------

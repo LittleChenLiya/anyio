@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from abc import ABCMeta, abstractmethod
+from abc import ABC, ABCMeta, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Generic, TypeAlias, TypeVar
 
@@ -172,6 +172,51 @@ class ByteStream(ByteReceiveStream, ByteSendStream):
 
         You should not try to send any further data to this stream after calling this
         method. This method is idempotent (does nothing on successive calls).
+        """
+
+
+class TransactionalByteSink(ABC):
+    """
+    An interface for transactional byte sinks.
+
+    A transactional sink accepts data through :meth:`write`, but the written data is
+    not published until :meth:`commit` is called. Calling :meth:`abort` discards all
+    written data without publishing it. Neither method may be called more than once.
+
+    .. note:: The sink is responsible for implementing the atomicity guarantees of
+        :meth:`commit`. The transfer utility using this interface does not provide its
+        own rollback mechanism; it relies on the sink's :meth:`abort` to discard
+        uncommitted data.
+    """
+
+    @abstractmethod
+    async def write(self, item: bytes) -> None:
+        """
+        Write a chunk of bytes to the transaction.
+
+        :param item: the bytes to write
+        :raises ~anyio.BrokenResourceError: if the transaction has already been
+            finalized (committed or aborted)
+        """
+
+    @abstractmethod
+    async def commit(self) -> None:
+        """
+        Atomically publish all data written through :meth:`write`.
+
+        This is the only operation that publishes the written data.
+
+        :raises ~anyio.BrokenResourceError: if the transaction has already been
+            finalized (committed or aborted)
+        """
+
+    @abstractmethod
+    async def abort(self) -> None:
+        """
+        Discard all data written through :meth:`write` without publishing it.
+
+        :raises ~anyio.BrokenResourceError: if the transaction has already been
+            finalized (committed or aborted)
         """
 
 

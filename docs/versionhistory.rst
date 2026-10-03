@@ -5,6 +5,11 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added ``anyio.streams.transfer.transfer_stream()`` for streaming bytes from a
+  single source to a transactional sink, verifying the SHA-256 digest and total
+  length before committing, and aborting on any failure or cancellation
+- Added ``anyio.abc.TransactionalByteSink``, the abstract base class for
+  transactional byte sinks providing ``write()``, ``commit()`` and ``abort()``
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends
