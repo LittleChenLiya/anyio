@@ -5,6 +5,10 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added ``HalfCloseableStapledByteStream``, a stapled byte stream variant with
+  explicit half-close support: ``send_eof()`` only closes the send side, and
+  ``aclose()`` closes both sides idempotently, attempting each close even if the
+  other one fails and finishing the cleanup before propagating cancellation
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends

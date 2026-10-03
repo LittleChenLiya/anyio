@@ -144,6 +144,13 @@ It comes in two variants:
 * :class:`~.streams.stapled.StapledObjectStream` (combines an
   :class:`~.abc.ObjectReceiveStream` with a compatible :class:`~.abc.ObjectSendStream`)
 
+There is also :class:`~.streams.stapled.HalfCloseableStapledByteStream`, a variant of
+the byte stream adapter with explicit half-close support: its ``send_eof()`` method
+only closes the send side, leaving the receive side open for reading any remaining
+data, and its ``aclose()`` method closes both sides idempotently, attempting to close
+each side even if closing the other one fails, and finishing the cleanup in a
+shielded scope if the close operation is cancelled.
+
 Buffered byte streams
 ---------------------
 

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 __all__ = (
+    "HalfCloseableStapledByteStream",
     "MultiListener",
     "StapledByteStream",
     "StapledObjectStream",
 )
 
+import sys
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
 
+from .. import CancelScope, ClosedResourceError, get_cancelled_exc_class
 from ..abc import (
     ByteReceiveStream,
     ByteSendStream,
@@ -20,6 +23,9 @@ from ..abc import (
     ObjectStream,
     TaskGroup,
 )
+
+if sys.version_info < (3, 11):
+    from exceptiongroup import ExceptionGroup
 
 T_Item = TypeVar("T_Item")
 T_Stream = TypeVar("T_Stream")
@@ -62,6 +68,95 @@ class StapledByteStream(ByteStream):
             **self.send_stream.extra_attributes,
             **self.receive_stream.extra_attributes,
         }
+
+
+@dataclass(eq=False)
+class HalfCloseableStapledByteStream(StapledByteStream):
+    """
+    Combines two byte streams into a single bidirectional byte stream with
+    explicit half-close support.
+
+    Unlike :class:`StapledByteStream`, this adapter keeps track of the close
+    state of each direction separately:
+
+    * :meth:`send_eof` closes only the send side, leaving the receive side open
+      so that any remaining incoming data can still be read.
+    * :meth:`aclose` attempts to close both sides, even if closing the first one
+      fails. It is idempotent: the underlying streams are closed at most once
+      each, no matter how many times it is called.
+    * If :meth:`aclose` is cancelled, the remaining cleanup is finished in a
+      shielded scope before the cancellation is re-raised to the caller.
+
+    Extra attributes will be provided from both streams, with the receive stream
+    providing the values in case of a conflict.
+
+    :param ByteSendStream send_stream: the sending byte stream
+    :param ByteReceiveStream receive_stream: the receiving byte stream
+    """
+
+    _send_closed: bool = field(init=False, default=False)
+    _receive_closed: bool = field(init=False, default=False)
+
+    async def receive(self, max_bytes: int = 65536) -> bytes:
+        if self._receive_closed:
+            raise ClosedResourceError
+
+        return await super().receive(max_bytes)
+
+    async def send(self, item: bytes) -> None:
+        if self._send_closed:
+            raise ClosedResourceError
+
+        await self.send_stream.send(item)
+
+    async def send_eof(self) -> None:
+        if self._send_closed:
+            return
+
+        self._send_closed = True
+        await self.send_stream.aclose()
+
+    async def aclose(self) -> None:
+        try:
+            await self._close_streams()
+        except get_cancelled_exc_class():
+            # Finish the remaining cleanup in a shielded scope, then pass the
+            # cancellation on to the caller
+            with CancelScope(shield=True):
+                await self._close_streams()
+
+            raise
+
+    async def _close_streams(self) -> None:
+        errors: list[Exception] = []
+        if not self._send_closed:
+            self._send_closed = True
+            try:
+                await self.send_stream.aclose()
+            except Exception as exc:
+                errors.append(exc)
+
+        if not self._receive_closed:
+            self._receive_closed = True
+            try:
+                await self.receive_stream.aclose()
+            except Exception as exc:
+                errors.append(exc)
+
+        if len(errors) == 1:
+            raise errors[0]
+        elif errors:
+            raise ExceptionGroup("errors while closing the stapled stream", errors)
+
+    @property
+    def send_closed(self) -> bool:
+        """Return ``True`` if the send side has been closed."""
+        return self._send_closed
+
+    @property
+    def receive_closed(self) -> bool:
+        """Return ``True`` if the receive side has been closed."""
+        return self._receive_closed
 
 
 @dataclass(eq=False)
