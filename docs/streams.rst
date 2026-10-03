@@ -144,6 +144,89 @@ It comes in two variants:
 * :class:`~.streams.stapled.StapledObjectStream` (combines an
   :class:`~.abc.ObjectReceiveStream` with a compatible :class:`~.abc.ObjectSendStream`)
 
+For byte streams that need explicit half-close semantics,
+:class:`~.streams.stapled.HalfCloseByteStream` wraps a send and receive stream pair and
+keeps track of the closed state of both directions. Calling
+:meth:`~.streams.stapled.HalfCloseByteStream.send_eof` only closes the send stream, so
+the receive stream keeps working until :meth:`~.streams.stapled.HalfCloseByteStream.aclose`
+is called. Repeated calls to either method do not call the underlying streams'
+``aclose()`` more than once, and ``aclose()`` always attempts to close both streams even
+if closing the send stream raised an exception. If ``aclose()`` is cancelled while
+closing, the cleanup of both streams is still completed before the cancellation is
+propagated to the caller.
+
+Example::
+
+    from anyio import ClosedResourceError, run
+    from anyio.abc import ByteReceiveStream, ByteSendStream
+    from anyio.streams.stapled import HalfCloseByteStream
+
+
+    class MemoryByteSendStream(ByteSendStream):
+        def __init__(self):
+            self.buffer = bytearray()
+            self.closed = False
+
+        async def send(self, item):
+            if self.closed:
+                raise ClosedResourceError
+            self.buffer.extend(item)
+
+        async def aclose(self):
+            self.closed = True
+
+
+    class MemoryByteReceiveStream(ByteReceiveStream):
+        def __init__(self, data=b""):
+            self.buffer = bytearray(data)
+            self.closed = False
+
+        async def receive(self, max_bytes=65536):
+            if self.closed:
+                raise ClosedResourceError
+            data = bytes(self.buffer[:max_bytes])
+            del self.buffer[:max_bytes]
+            return data
+
+        async def aclose(self):
+            self.closed = True
+
+
+    async def main():
+        send = MemoryByteSendStream()
+        receive = MemoryByteReceiveStream(b"reply")
+        stream = HalfCloseByteStream(send, receive)
+
+        await stream.send(b"hello")
+        await stream.send_eof()
+        print("send closed:", stream.send_closed)
+        print("receive closed:", stream.receive_closed)
+
+        # The receive side keeps working after the send side has been closed
+        print("received:", await stream.receive())
+
+        # Sending after EOF raises a closed resource error
+        try:
+            await stream.send(b"world")
+        except ClosedResourceError:
+            print("send after EOF: ClosedResourceError")
+
+        await stream.aclose()
+        print("after aclose, send closed:", stream.send_closed)
+        print("after aclose, receive closed:", stream.receive_closed)
+
+
+    run(main)
+
+The above script gives the following output::
+
+    send closed: True
+    receive closed: False
+    received: b'reply'
+    send after EOF: ClosedResourceError
+    after aclose, send closed: True
+    after aclose, receive closed: True
+
 Buffered byte streams
 ---------------------
 

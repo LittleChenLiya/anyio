@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import sys
+
 __all__ = (
+    "HalfCloseByteStream",
     "MultiListener",
     "StapledByteStream",
     "StapledObjectStream",
 )
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
 
+from .. import CancelScope, ClosedResourceError
 from ..abc import (
     ByteReceiveStream,
     ByteSendStream,
@@ -20,6 +24,10 @@ from ..abc import (
     ObjectStream,
     TaskGroup,
 )
+from ..lowlevel import checkpoint
+
+if sys.version_info < (3, 11):
+    from exceptiongroup import BaseExceptionGroup
 
 T_Item = TypeVar("T_Item")
 T_Stream = TypeVar("T_Stream")
@@ -62,6 +70,101 @@ class StapledByteStream(ByteStream):
             **self.send_stream.extra_attributes,
             **self.receive_stream.extra_attributes,
         }
+
+
+@dataclass(eq=False)
+class HalfCloseByteStream(StapledByteStream):
+    """
+    A :class:`~.abc.ByteStream` adapter that combines a
+    :class:`~.abc.ByteSendStream` and a :class:`~.abc.ByteReceiveStream` into a
+    single bidirectional byte stream with explicit half-close semantics.
+
+    Unlike :class:`StapledByteStream`, this adapter keeps explicit track of the
+    closed state of both directions:
+
+    * :meth:`send_eof` only closes the send stream; the receive stream keeps
+      working until :meth:`aclose` is called.
+    * :meth:`aclose` closes both streams, but always attempts to close the
+      receive stream even if closing the send stream raised an exception. If
+      both closes raise, the exceptions are raised together as an exception
+      group.
+    * Neither :meth:`send_eof` nor :meth:`aclose` will call the underlying
+      streams' ``aclose()`` more than once.
+    * If :meth:`aclose` is cancelled while closing the streams, the cleanup of
+      both streams is still completed before the cancellation is propagated to
+      the caller.
+
+    :param ByteSendStream send_stream: the sending byte stream
+    :param ByteReceiveStream receive_stream: the receiving byte stream
+    """
+
+    _send_closed: bool = field(init=False, default=False)
+    _receive_closed: bool = field(init=False, default=False)
+
+    async def receive(self, max_bytes: int = 65536) -> bytes:
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer")
+
+        if self._receive_closed:
+            raise ClosedResourceError
+
+        return await self.receive_stream.receive(max_bytes)
+
+    async def send(self, item: bytes) -> None:
+        if self._send_closed or self._receive_closed:
+            raise ClosedResourceError
+
+        await self.send_stream.send(item)
+
+    async def send_eof(self) -> None:
+        if self._send_closed:
+            return
+
+        self._send_closed = True
+        await self.send_stream.aclose()
+
+    async def aclose(self) -> None:
+        if self._receive_closed:
+            return
+
+        errors: list[BaseException] = []
+        with CancelScope(shield=True):
+            if not self._send_closed:
+                self._send_closed = True
+                try:
+                    await self.send_stream.aclose()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            if not self._receive_closed:
+                self._receive_closed = True
+                try:
+                    await self.receive_stream.aclose()
+                except BaseException as exc:
+                    errors.append(exc)
+
+        if errors:
+            if len(errors) == 1:
+                raise errors[0]
+
+            raise BaseExceptionGroup(
+                "Multiple exceptions occurred while closing the byte stream",
+                errors,
+            )
+
+        # If the enclosing scope was cancelled while we were closing, propagate the
+        # cancellation now that the cleanup has finished
+        await checkpoint()
+
+    @property
+    def send_closed(self) -> bool:
+        """``True`` if the send side of the stream has been closed."""
+        return self._send_closed
+
+    @property
+    def receive_closed(self) -> bool:
+        """``True`` if the receive side of the stream has been closed."""
+        return self._receive_closed
 
 
 @dataclass(eq=False)

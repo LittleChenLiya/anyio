@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import InitVar, dataclass, field
@@ -7,14 +8,28 @@ from typing import TypeVar
 
 import pytest
 
-from anyio import ClosedResourceError, EndOfStream
+from anyio import (
+    CancelScope,
+    ClosedResourceError,
+    EndOfStream,
+    Event,
+    create_task_group,
+    get_cancelled_exc_class,
+)
 from anyio.abc import (
     ByteReceiveStream,
     ByteSendStream,
     ObjectReceiveStream,
     ObjectSendStream,
 )
-from anyio.streams.stapled import StapledByteStream, StapledObjectStream
+from anyio.streams.stapled import (
+    HalfCloseByteStream,
+    StapledByteStream,
+    StapledObjectStream,
+)
+
+if sys.version_info < (3, 11):
+    from exceptiongroup import ExceptionGroup
 
 
 @dataclass
@@ -98,6 +113,229 @@ class TestStapledByteStream:
     @pytest.mark.parametrize("max_bytes", [0, -1])
     async def test_receive_invalid_max_bytes(
         self, stapled: StapledByteStream, max_bytes: int
+    ) -> None:
+        with pytest.raises(ValueError, match="max_bytes must be a positive integer"):
+            await stapled.receive(max_bytes)
+
+
+@dataclass
+class CountingByteSendStream(ByteSendStream):
+    buffer: bytearray = field(init=False, default_factory=bytearray)
+    closed: int = field(init=False, default=0)
+    fail_close: bool = field(init=False, default=False)
+    block_close: bool = field(init=False, default=False)
+    close_started: Event = field(init=False, default_factory=Event)
+    close_event: Event = field(init=False, default_factory=Event)
+
+    async def send(self, item: bytes) -> None:
+        if self.closed:
+            raise ClosedResourceError
+
+        self.buffer.extend(item)
+
+    async def aclose(self) -> None:
+        self.closed += 1
+        self.close_started.set()
+        if self.block_close:
+            await self.close_event.wait()
+
+        if self.fail_close:
+            raise RuntimeError("send stream close failed")
+
+
+@dataclass
+class CountingByteReceiveStream(ByteReceiveStream):
+    data: InitVar[bytes]
+    buffer: bytearray = field(init=False)
+    closed: int = field(init=False, default=0)
+    fail_close: bool = field(init=False, default=False)
+
+    def __post_init__(self, data: bytes) -> None:
+        self.buffer = bytearray(data)
+
+    async def receive(self, max_bytes: int = 65536) -> bytes:
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer")
+
+        if self.closed:
+            raise ClosedResourceError
+
+        data = bytes(self.buffer[:max_bytes])
+        del self.buffer[:max_bytes]
+        return data
+
+    async def aclose(self) -> None:
+        self.closed += 1
+        if self.fail_close:
+            raise ValueError("receive stream close failed")
+
+
+class TestHalfCloseByteStream:
+    @pytest.fixture
+    def send_stream(self) -> CountingByteSendStream:
+        return CountingByteSendStream()
+
+    @pytest.fixture
+    def receive_stream(self) -> CountingByteReceiveStream:
+        return CountingByteReceiveStream(b"reply")
+
+    @pytest.fixture
+    def stapled(
+        self,
+        send_stream: CountingByteSendStream,
+        receive_stream: CountingByteReceiveStream,
+    ) -> HalfCloseByteStream:
+        return HalfCloseByteStream(send_stream, receive_stream)
+
+    async def test_send_eof_keeps_receive_open(
+        self,
+        stapled: HalfCloseByteStream,
+        send_stream: CountingByteSendStream,
+        receive_stream: CountingByteReceiveStream,
+    ) -> None:
+        await stapled.send(b"hello")
+        await stapled.send_eof()
+
+        assert stapled.send_closed is True
+        assert stapled.receive_closed is False
+        assert send_stream.buffer == b"hello"
+        assert send_stream.closed == 1
+        assert receive_stream.closed == 0
+
+        with pytest.raises(ClosedResourceError):
+            await stapled.send(b"world")
+
+        assert await stapled.receive() == b"reply"
+
+    async def test_send_eof_is_idempotent(
+        self,
+        stapled: HalfCloseByteStream,
+        send_stream: CountingByteSendStream,
+    ) -> None:
+        await stapled.send_eof()
+        await stapled.send_eof()
+
+        assert send_stream.closed == 1
+
+    async def test_aclose_closes_both_sides(
+        self,
+        stapled: HalfCloseByteStream,
+        send_stream: CountingByteSendStream,
+        receive_stream: CountingByteReceiveStream,
+    ) -> None:
+        await stapled.aclose()
+
+        assert stapled.send_closed is True
+        assert stapled.receive_closed is True
+        assert send_stream.closed == 1
+        assert receive_stream.closed == 1
+
+        with pytest.raises(ClosedResourceError):
+            await stapled.send(b"")
+        with pytest.raises(ClosedResourceError):
+            await stapled.receive()
+
+    async def test_aclose_is_idempotent(
+        self,
+        stapled: HalfCloseByteStream,
+        send_stream: CountingByteSendStream,
+        receive_stream: CountingByteReceiveStream,
+    ) -> None:
+        await stapled.aclose()
+        await stapled.aclose()
+
+        assert send_stream.closed == 1
+        assert receive_stream.closed == 1
+
+    async def test_send_eof_then_aclose_does_not_reclose_send(
+        self,
+        stapled: HalfCloseByteStream,
+        send_stream: CountingByteSendStream,
+        receive_stream: CountingByteReceiveStream,
+    ) -> None:
+        await stapled.send_eof()
+        await stapled.aclose()
+
+        assert send_stream.closed == 1
+        assert receive_stream.closed == 1
+
+    async def test_aclose_send_close_failure_still_closes_receive(
+        self,
+        send_stream: CountingByteSendStream,
+        receive_stream: CountingByteReceiveStream,
+    ) -> None:
+        send_stream.fail_close = True
+        stapled = HalfCloseByteStream(send_stream, receive_stream)
+
+        with pytest.raises(RuntimeError, match="send stream close failed"):
+            await stapled.aclose()
+
+        assert send_stream.closed == 1
+        assert receive_stream.closed == 1
+
+    async def test_aclose_receive_close_failure_still_closes_send(
+        self,
+        send_stream: CountingByteSendStream,
+        receive_stream: CountingByteReceiveStream,
+    ) -> None:
+        receive_stream.fail_close = True
+        stapled = HalfCloseByteStream(send_stream, receive_stream)
+
+        with pytest.raises(ValueError, match="receive stream close failed"):
+            await stapled.aclose()
+
+        assert send_stream.closed == 1
+        assert receive_stream.closed == 1
+
+    async def test_aclose_both_close_failures(
+        self,
+        send_stream: CountingByteSendStream,
+        receive_stream: CountingByteReceiveStream,
+    ) -> None:
+        send_stream.fail_close = True
+        receive_stream.fail_close = True
+        stapled = HalfCloseByteStream(send_stream, receive_stream)
+
+        with pytest.raises(ExceptionGroup) as exc_info:
+            await stapled.aclose()
+
+        assert len(exc_info.value.exceptions) == 2
+        assert send_stream.closed == 1
+        assert receive_stream.closed == 1
+
+    async def test_aclose_cancelled_during_close_completes_cleanup(
+        self,
+        send_stream: CountingByteSendStream,
+        receive_stream: CountingByteReceiveStream,
+    ) -> None:
+        send_stream.block_close = True
+        stapled = HalfCloseByteStream(send_stream, receive_stream)
+        got_cancelled = False
+
+        async def close_and_record() -> None:
+            nonlocal got_cancelled
+            try:
+                await stapled.aclose()
+            except get_cancelled_exc_class():
+                got_cancelled = True
+
+        async def cancel_then_unblock() -> None:
+            await send_stream.close_started.wait()
+            outer.cancel()
+            send_stream.close_event.set()
+
+        with CancelScope() as outer:
+            async with create_task_group() as tg:
+                tg.start_soon(close_and_record)
+                tg.start_soon(cancel_then_unblock)
+
+        assert got_cancelled is True
+        assert send_stream.closed == 1
+        assert receive_stream.closed == 1
+
+    @pytest.mark.parametrize("max_bytes", [0, -1])
+    async def test_receive_invalid_max_bytes(
+        self, stapled: HalfCloseByteStream, max_bytes: int
     ) -> None:
         with pytest.raises(ValueError, match="max_bytes must be a positive integer"):
             await stapled.receive(max_bytes)
