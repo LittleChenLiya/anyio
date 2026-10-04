@@ -5,6 +5,10 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added ``anyio.from_thread.CompletionUnit``, a one-shot completion unit bound to a
+  blocking portal that lets worker threads deliver a single result or exception to
+  any number of asynchronous waiters, with the final decision made atomically in the
+  event loop thread
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends

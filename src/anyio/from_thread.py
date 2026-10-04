@@ -3,6 +3,9 @@ from __future__ import annotations
 __all__ = (
     "BlockingPortal",
     "BlockingPortalProvider",
+    "CompletionUnit",
+    "CompletionUnitFailedError",
+    "CompletionUnitUnreachableError",
     "check_cancelled",
     "run",
     "run_sync",
@@ -26,6 +29,7 @@ from types import TracebackType
 from typing import (
     Any,
     Generic,
+    NamedTuple,
     TypeVar,
     cast,
     overload,
@@ -36,7 +40,7 @@ from ._core._eventloop import (
     threadlocals,
 )
 from ._core._eventloop import run as run_eventloop
-from ._core._exceptions import NoEventLoopError
+from ._core._exceptions import ClosedResourceError, NoEventLoopError
 from ._core._synchronization import Event
 from ._core._tasks import CancelScope, create_task_group
 from .abc._tasks import TaskStatus
@@ -443,6 +447,203 @@ class BlockingPortal:
 
         """
         return _BlockingAsyncContextManager(cm, self)
+
+
+class CompletionUnitFailedError(Exception):
+    """
+    Raised by :meth:`CompletionUnit.wait` when the completion unit was finalized
+    with an exception submitted by a worker thread.
+
+    The originally submitted exception is available as the ``__cause__``
+    attribute. A fresh instance of this error is raised in every waiter, so the
+    tracebacks of concurrent waiters never get mixed into each other or into the
+    submitted exception.
+
+    .. versionadded:: 4.16.0
+    """
+
+
+class CompletionUnitUnreachableError(RuntimeError):
+    """
+    Raised by the submission methods of :class:`CompletionUnit` when the bound
+    blocking portal is no longer running, making the event loop unreachable.
+
+    This is raised instead of silently pretending that the submission succeeded.
+
+    .. versionadded:: 4.16.0
+    """
+
+
+class _Outcome(NamedTuple):
+    is_error: bool
+    payload: Any
+
+
+class CompletionUnit(Generic[T_Retval]):
+    """
+    A one-shot completion unit bound to an event loop and a blocking portal.
+
+    Worker threads finalize the unit by submitting either a result
+    (:meth:`submit_result`) or an exception (:meth:`submit_exception`). Every
+    submission is routed through the bound :class:`BlockingPortal`, so the final
+    decision is made atomically in the event loop thread and the internal event
+    is never set directly from a foreign thread. Only the first submission to
+    arrive wins; the submitting thread is told whether it won (``True``) or lost
+    (``False``).
+
+    Any number of asynchronous tasks may :meth:`wait` for the outcome, and they
+    all receive the same first submission (``None`` is a valid result value).
+    Cancelling an individual waiter has no effect on the unit or on the other
+    waiters.
+
+    The lifecycle of a completion unit is as follows:
+
+    #. Create the unit in the event loop thread, bound to a running
+       :class:`BlockingPortal`.
+    #. Let worker threads submit a result or an exception while asynchronous
+       tasks wait for the outcome.
+    #. Close the unit with :meth:`aclose` (or by leaving the ``async with``
+       block) when it is no longer needed. Closing wakes up any remaining
+       waiters with :exc:`~anyio.ClosedResourceError`.
+
+    Submissions made after the unit has been closed are rejected with
+    :exc:`~anyio.ClosedResourceError`. Submissions made after the bound portal
+    has been shut down fail with :exc:`CompletionUnitUnreachableError` instead
+    of being silently accepted.
+
+    :param portal: the blocking portal bound to the event loop that owns this
+        unit
+
+    .. versionadded:: 4.16.0
+    """
+
+    def __init__(self, portal: BlockingPortal) -> None:
+        self._portal = portal
+        self._event = Event()
+        self._outcome: _Outcome | None = None
+        self._closed = False
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        await self.aclose()
+
+    @property
+    def done(self) -> bool:
+        """Return ``True`` if the unit has been finalized or closed."""
+        return self._outcome is not None or self._closed
+
+    def _finalize(self, outcome: _Outcome) -> bool:
+        # This method only ever runs in the event loop thread, via the portal,
+        # which makes the first-submission-wins decision atomic.
+        if self._closed:
+            raise ClosedResourceError("this completion unit has been closed")
+
+        if self._outcome is not None:
+            return False
+
+        self._outcome = outcome
+        self._event.set()
+        return True
+
+    def _submit(self, outcome: _Outcome) -> bool:
+        if self._portal._event_loop_thread_id == get_ident():
+            raise RuntimeError(
+                "submissions to a completion unit must be made from an external "
+                "thread, not from the event loop thread"
+            )
+
+        try:
+            return self._portal.call(self._finalize, outcome)
+        except RuntimeError as exc:
+            raise CompletionUnitUnreachableError(
+                "the event loop bound to this completion unit is unreachable "
+                "(the blocking portal has been shut down)"
+            ) from exc
+
+    def submit_result(self, value: T_Retval) -> bool:
+        """
+        Submit a successful result from a worker thread.
+
+        The submission is finalized atomically in the event loop thread via the
+        bound blocking portal. ``None`` is a valid result value.
+
+        :param value: the result value to deliver to the waiters
+        :return: ``True`` if this submission finalized the unit, ``False`` if
+            another submission had already finalized it
+        :raises ClosedResourceError: if the unit has been closed
+        :raises CompletionUnitUnreachableError: if the bound blocking portal is
+            no longer running
+
+        """
+        return self._submit(_Outcome(False, value))
+
+    def submit_exception(self, exc: BaseException) -> bool:
+        """
+        Submit an exception from a worker thread.
+
+        The waiters will raise :exc:`CompletionUnitFailedError` with the
+        submitted exception as its ``__cause__``.
+
+        :param exc: the exception to deliver to the waiters
+        :return: ``True`` if this submission finalized the unit, ``False`` if
+            another submission had already finalized it
+        :raises ClosedResourceError: if the unit has been closed
+        :raises CompletionUnitUnreachableError: if the bound blocking portal is
+            no longer running
+
+        """
+        return self._submit(_Outcome(True, exc))
+
+    async def wait(self) -> T_Retval:
+        """
+        Wait for the first submission to finalize the unit.
+
+        All waiters receive the same outcome. Cancelling one waiter does not
+        cancel the unit or affect any other waiter.
+
+        :return: the submitted result value (which may be ``None``)
+        :raises CompletionUnitFailedError: if the unit was finalized with an
+            exception (available as ``__cause__``)
+        :raises ClosedResourceError: if the unit was closed before any
+            submission arrived
+
+        """
+        await self._event.wait()
+        outcome = self._outcome
+        if outcome is None:
+            raise ClosedResourceError(
+                "the completion unit was closed before any submission arrived"
+            )
+
+        if outcome.is_error:
+            # Raise a fresh wrapper in each waiter so that their tracebacks
+            # never get tangled up with each other or with the shared,
+            # submitted exception.
+            raise CompletionUnitFailedError(
+                f"the completion unit was finalized with an exception: "
+                f"{outcome.payload!r}"
+            ) from outcome.payload
+
+        return cast(T_Retval, outcome.payload)
+
+    async def aclose(self) -> None:
+        """
+        Close the unit, waking up any remaining waiters.
+
+        Waiters still waiting for an outcome are woken with
+        :exc:`~anyio.ClosedResourceError`, and any further submissions are
+        rejected. This method must be called in the event loop thread.
+        """
+        if not self._closed:
+            self._closed = True
+            self._event.set()
 
 
 @dataclass

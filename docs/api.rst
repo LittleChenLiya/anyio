@@ -76,6 +76,10 @@ Running asynchronous code from other threads
 
 .. autoclass:: anyio.from_thread.BlockingPortal
 .. autoclass:: anyio.from_thread.BlockingPortalProvider
+.. autoclass:: anyio.from_thread.CompletionUnit
+
+.. autoexception:: anyio.from_thread.CompletionUnitFailedError
+.. autoexception:: anyio.from_thread.CompletionUnitUnreachableError
 
 Async file I/O
 --------------

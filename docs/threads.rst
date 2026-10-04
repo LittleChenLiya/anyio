@@ -267,6 +267,57 @@ at the same time, the same blocking portal will be used to handle the async call
 inside. It's easy to see that this is much more efficient than having each call spawn
 its own blocking portal.
 
+Delivering one-shot results from worker threads
+-----------------------------------------------
+
+When a worker thread needs to deliver a single outcome to one or more asynchronous
+tasks, you can use :class:`~.from_thread.CompletionUnit`. A completion unit is bound
+to the event loop that owns its :class:`~.from_thread.BlockingPortal`, and is
+finalized exactly once – by whichever worker thread submits first::
+
+    from anyio.from_thread import BlockingPortal, CompletionUnit
+
+    def worker(unit: CompletionUnit[str]) -> None:
+        try:
+            result = do_expensive_computation()
+        except Exception as exc:
+            unit.submit_exception(exc)  # waiters will raise
+        else:
+            unit.submit_result(result)  # waiters receive the value
+
+    async def main() -> None:
+        async with BlockingPortal() as portal:
+            async with CompletionUnit[str](portal) as unit:
+                start_worker_thread(unit)
+                outcome = await unit.wait()
+
+The lifecycle of a completion unit is:
+
+#. **Create** the unit in the event loop thread, bound to a running blocking portal.
+#. **Submit** from any worker thread with
+   :meth:`~.from_thread.CompletionUnit.submit_result` or
+   :meth:`~.from_thread.CompletionUnit.submit_exception`. The submission is routed
+   through the portal so the final decision is made atomically in the event loop
+   thread; only the first submission wins and the method returns ``True`` to the
+   winner and ``False`` to any later submitter. ``None`` is a valid result value.
+#. **Wait** with :meth:`~.from_thread.CompletionUnit.wait` from any number of
+   asynchronous tasks. All waiters receive the same first submission, and cancelling
+   one waiter does not cancel the unit or disturb the other waiters. If an exception
+   was submitted, each waiter raises its own
+   :class:`~.from_thread.CompletionUnitFailedError` with the submitted exception as
+   its ``__cause__``, so waiters never share tracebacks.
+#. **Close** the unit with :meth:`~.from_thread.CompletionUnit.aclose` (or by leaving
+   the ``async with`` block). Closing wakes any remaining waiters with
+   :exc:`~anyio.ClosedResourceError`, and later submissions are rejected with the
+   same error. If the bound portal has already been shut down, submissions fail with
+   :class:`~.from_thread.CompletionUnitUnreachableError` instead of pretending to
+   succeed.
+
+The accompanying test suite (which runs on both the asyncio and Trio backends) can be
+run with::
+
+    pytest tests/test_completion_unit.py
+
 Context propagation
 -------------------
 
