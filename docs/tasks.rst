@@ -299,6 +299,30 @@ copy of the caller's context.
 
 .. _context: https://docs.python.org/3/library/contextvars.html
 
+Bounded task submission
+-----------------------
+
+The :class:`~.BoundedTaskSubmitter` wraps a task group and limits the number of
+concurrently running tasks. Producers call :meth:`~.BoundedTaskSubmitter.submit`,
+which waits for a free slot before handing the task to the group. The slot is released
+only when the task truly finishes, so producers naturally apply backpressure.
+
+Closing the submitter rejects any new submissions (raising
+:class:`~.ClosedResourceError`), while tasks already accepted keep running and remain
+tracked by the underlying task group. Producers blocked in
+:meth:`~.BoundedTaskSubmitter.submit` are woken up (and rejected) as the accepted tasks
+finish::
+
+    async with create_task_group() as tg:
+        submitter = BoundedTaskSubmitter(tg, capacity=2)
+
+        async def worker(i: int) -> int:
+            return i * 2
+
+        handles = [await submitter.submit(worker, i) for i in range(5)]
+        results = [await handle for handle in handles]
+        submitter.close()
+
 Asyncio-specific notes
 ----------------------
 

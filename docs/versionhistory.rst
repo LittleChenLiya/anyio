@@ -29,6 +29,10 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
   from within ``from_thread.run_sync()``), where ``asyncio.current_task()`` is
   legitimately ``None``
   (`#773 <https://github.com/agronholm/anyio/issues/773>`_; PR by @AmirF194)
+- Added ``BoundedTaskSubmitter``, a task group wrapper that limits the number of
+  concurrently running tasks by making producers wait for a free slot, which is
+  released only when the submitted task truly finishes. Closing the submitter rejects
+  new submissions while letting accepted tasks run to completion under the task group
 
 **4.15.1**
 
