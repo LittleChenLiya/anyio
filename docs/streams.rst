@@ -241,7 +241,53 @@ Example::
 .. versionadded:: 3.0
 
 
+Transactional stream transfers
+------------------------------
+
+.. py:currentmodule:: anyio.streams.transactional
+
+Sometimes a byte stream carries an artifact that should only be published once it has
+been received in full and verified. The :func:`transfer_to_sink` function transfers
+bytes from a single source stream into a *transactional sink* – any object implementing
+the :class:`TransactionalSink` protocol (``write()``, ``commit()`` and ``abort()``) –
+while computing the SHA-256 digest on the fly and enforcing an optional size limit. The
+content is never collected in memory as a whole.
+
+The sink is committed only when the source reaches EOF and both the length and the
+expected digest check out. On any failure or cancellation the sink is aborted first and
+the original error is then re-raised. A failing ``abort()`` never masks the original
+error, and a failing ``commit()`` is never reported as a successful publish. Ownership
+of the source stream is controlled with the ``close_source`` option, and the transfer
+runs sequentially in the current task without spawning background tasks.
+
+.. note:: The transfer utility relies on the sink to honor the transactional protocol.
+   It does not, by itself, make an arbitrary writer capable of rollback.
+
+Example::
+
+    import hashlib
+
+    from anyio import run
+    from anyio.streams.file import FileReadStream
+    from anyio.streams.transactional import transfer_to_sink
+
+
+    async def main():
+        digest = hashlib.sha256(b'Hello, World!').hexdigest()
+        async with await FileReadStream.from_path('/tmp/testfile') as source:
+            async with create_my_transactional_sink() as sink:
+                result = await transfer_to_sink(
+                    source, sink, expected_sha256=digest, max_bytes=2**20,
+                )
+                print(f'committed {result.bytes_transferred} bytes')
+
+    run(main)
+
+.. versionadded:: 4.16
+
+
 .. _TLS:
+
 
 TLS streams
 -----------

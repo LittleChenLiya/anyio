@@ -110,6 +110,7 @@ future-annotations = true
 extend-safe-fixes = ["TC001"]
 
 [tool.ruff.lint.per-file-ignores]
+"examples/*.py" = ["T201"]
 "tests/test_tempfile.py" = ["ASYNC230"]
 "tests/*.py" = ["ASYNC240"]
 

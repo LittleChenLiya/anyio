@@ -153,6 +153,9 @@ Streams and stream wrappers
 .. autoclass:: anyio.streams.tls.TLSStream
 .. autoclass:: anyio.streams.tls.TLSListener
 .. autoclass:: anyio.streams.tls.TLSConnectable
+.. autoclass:: anyio.streams.transactional.TransactionalSink
+.. autoclass:: anyio.streams.transactional.TransferResult
+.. autofunction:: anyio.streams.transactional.transfer_to_sink
 
 Sockets and networking
 ----------------------
