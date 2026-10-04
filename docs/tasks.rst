@@ -373,3 +373,66 @@ This results in an output like:
                   |   File '/tmp/foo.py', line 11, in async foo()
 
 .. _call graph introspection: https://docs.python.org/3.14/library/asyncio-graph.html
+
+Keyed task superseding
+----------------------
+
+.. py:currentmodule:: anyio
+
+When tasks are launched by some identity (a file name, a user ID, a job key...), it
+is often desirable that starting a new task for a key replaces the one currently
+running for that same key, while tasks with other keys keep running in parallel.
+The :class:`KeyedTaskRunner` class implements this pattern on top of a task group.
+
+Every start of a key bumps a monotonically increasing *generation* counter for that
+key and cancels the previous task. Only the current generation holds *publishing
+rights*: if a superseded task shields itself from cancellation and finishes (or
+fails) late, its result or exception is silently discarded and can never overwrite
+the outcome of a newer generation. Cancellation is always reported for the task it
+actually happened to, so the superseding itself stays observable.
+
+The three possible outcomes are delivered through three separate callbacks, so a
+cancellation can never be confused with a ``None`` result:
+
+* ``on_result(key, generation, result)``
+* ``on_exception(key, generation, exception)``
+* ``on_cancelled(key, generation)``
+
+Example::
+
+    from anyio import KeyedTaskRunner, create_task_group, run, sleep
+
+
+    async def download(name: str) -> str:
+        await sleep(1)
+        return f"contents of {name}"
+
+
+    async def main() -> None:
+        async with create_task_group() as tg:
+            async with KeyedTaskRunner(
+                tg,
+                on_result=lambda key, gen, result: print(key, "->", result),
+                on_exception=lambda key, gen, exc: print(key, "failed:", exc),
+                on_cancelled=lambda key, gen: print(key, "cancelled"),
+            ) as runner:
+                runner.start("report.txt", download, "report.txt")
+                runner.start("report.txt", download, "report.txt")  # supersedes
+                runner.start("data.csv", download, "data.csv")      # parallel
+
+    run(main)
+
+The lifecycle of a runner is as follows:
+
+#. The runner is created bound to an open task group, either directly or via
+   ``async with KeyedTaskRunner(task_group, ...) as runner:``.
+#. Tasks are scheduled with the synchronous
+   :meth:`~KeyedTaskRunner.start` method, which returns the new generation number.
+   :meth:`~KeyedTaskRunner.cancel` cancels a single key's current task and
+   :meth:`~KeyedTaskRunner.wait_idle` waits until no tasks are in flight.
+#. Closing the runner with :meth:`~KeyedTaskRunner.aclose` (implicit when leaving
+   the ``async with`` block) is terminal: further
+   :meth:`~KeyedTaskRunner.start` calls raise
+   :exc:`~anyio.ClosedResourceError`, all in-flight tasks are cancelled, and
+   ``aclose()`` returns only once every in-flight task has finished its cleanup,
+   including shielded cleanup code. A closed runner cannot be reused.

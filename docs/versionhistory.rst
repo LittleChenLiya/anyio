@@ -5,6 +5,10 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added the ``KeyedTaskRunner`` class which runs keyed tasks on a task group where
+  starting a new task with an existing key supersedes (cancels) the previous one.
+  Only the current generation of a key may publish its result or exception, and
+  results, exceptions and cancellations are reported through separate callbacks
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends

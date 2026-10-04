@@ -51,6 +51,7 @@ if TYPE_CHECKING or not install_lazy_importer():
     from ._core._fileio import open_file as open_file
     from ._core._fileio import wrap_file as wrap_file
     from ._core._futures import Future as Future
+    from ._core._keyed import KeyedTaskRunner as KeyedTaskRunner
     from ._core._resources import aclose_forcefully as aclose_forcefully
     from ._core._signals import open_signal_receiver as open_signal_receiver
     from ._core._sockets import TCPConnectable as TCPConnectable
