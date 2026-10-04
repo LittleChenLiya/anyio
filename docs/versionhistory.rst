@@ -5,6 +5,11 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added ``TaskGroup.create_bounded_submitter()`` along with the
+  ``anyio.BoundedTaskSubmitter`` class, which bound the number of concurrently
+  running tasks in a task group: producers wait for a free slot when submitting,
+  slots are released only when tasks actually finish, and closing the submitter
+  rejects new submissions while letting accepted tasks finish
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends

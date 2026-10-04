@@ -18,7 +18,7 @@ else:
     from typing_extensions import TypeVarTuple, Unpack
 
 if TYPE_CHECKING:
-    from .._core._tasks import CancelScope, TaskHandle
+    from .._core._tasks import BoundedTaskSubmitter, CancelScope, TaskHandle
 
 T_co = TypeVar("T_co", covariant=True)
 T_contra = TypeVar("T_contra", contravariant=True, default=None)
@@ -208,6 +208,25 @@ class TaskGroup(metaclass=ABCMeta):
 
         .. versionadded:: 3.0
         """
+
+    @final
+    def create_bounded_submitter(self, capacity: int) -> BoundedTaskSubmitter:
+        """
+        Create a bounded task submitter for this task group.
+
+        The submitter limits the number of concurrently running tasks to
+        ``capacity``. Producers submitting through it wait for a free slot,
+        and each slot is released only when its task has actually finished.
+
+        :param capacity: the maximum number of concurrently running tasks
+            (must be at least 1)
+        :return: a bounded task submitter
+
+        .. versionadded:: 4.15.0
+        """
+        from .._core._tasks import BoundedTaskSubmitter
+
+        return BoundedTaskSubmitter(self, capacity)
 
     @abstractmethod
     async def __aenter__(self) -> TaskGroup:

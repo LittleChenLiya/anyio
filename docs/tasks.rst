@@ -123,6 +123,38 @@ Both :meth:`~.abc.TaskGroup.start_soon` and :meth:`~.TaskGroup.create_task` retu
 .. versionchanged:: 4.14.0
     :meth:`~.abc.TaskGroup.start_soon` now returns a :class:`~.TaskHandle`.
 
+.. _bounded_submitter:
+
+Bounding the number of concurrently running tasks
+-------------------------------------------------
+
+When many tasks are submitted to a task group but only a limited number of them
+should run at any given time, you can create a
+:class:`~anyio.BoundedTaskSubmitter` from the task group with
+:meth:`TaskGroup.create_bounded_submitter() <.abc.TaskGroup.create_bounded_submitter>`.
+Producers submitting through it wait until a slot becomes free, and each slot is
+released only when its task has actually finished::
+
+    from anyio import create_task_group, run, sleep
+
+    async def worker(item: int) -> None:
+        print(f"processing {item}")
+        await sleep(1)
+
+    async def main() -> None:
+        async with create_task_group() as tg:
+            # At most 2 submitted tasks run concurrently
+            async with tg.create_bounded_submitter(2) as submitter:
+                for item in range(10):
+                    await submitter.submit(worker, item)
+            # After "close", new submissions are rejected with
+            # ClosedResourceError, but the already accepted tasks are
+            # still finished by the task group
+
+    run(main)
+
+.. versionadded:: 4.15.0
+
 .. _start_initialize:
 
 Starting and initializing tasks

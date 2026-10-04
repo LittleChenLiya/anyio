@@ -22,6 +22,7 @@ import anyio
 from anyio import (
     TASK_STATUS_IGNORED,
     CancelScope,
+    ClosedResourceError,
     Event,
     TaskCancelled,
     TaskFailed,
@@ -2508,3 +2509,200 @@ async def test_task_from_asyncgen_asend(create_task: bool) -> None:
         assert handle.name == "async_generator.asend"
 
         assert await handle == 8
+
+
+class _Barrier:
+    """A single-use two-party barrier for deterministic task interleaving."""
+
+    def __init__(self) -> None:
+        self._arrived = Event()
+        self._release = Event()
+
+    async def wait(self) -> None:
+        if self._arrived.is_set():
+            self._release.set()
+        else:
+            self._arrived.set()
+            await self._release.wait()
+
+
+class TestBoundedTaskSubmitter:
+    async def test_invalid_capacity(self) -> None:
+        async with create_task_group() as tg:
+            with pytest.raises(ValueError, match="capacity must be at least 1"):
+                tg.create_bounded_submitter(0)
+
+    async def test_submission_waits_for_free_slot(self) -> None:
+        """
+        With capacity 1, the second submission must not be turned into a task
+        while the first task is still running; the slot is released only when
+        the first task actually finishes.
+        """
+        first_started = Event()
+        release_first = Event()
+        factory_calls: list[str] = []
+        finished: list[str] = []
+
+        async def first() -> None:
+            factory_calls.append("first")
+            first_started.set()
+            await release_first.wait()
+            finished.append("first")
+
+        async def second() -> None:
+            factory_calls.append("second")
+            finished.append("second")
+
+        async with create_task_group() as tg:
+            submitter = tg.create_bounded_submitter(1)
+            await submitter.submit(first)
+            await first_started.wait()
+
+            producer = tg.start_soon(submitter.submit, second)
+            await wait_all_tasks_blocked()
+
+            # The first task still holds the only slot, so the second factory
+            # has not been called and no task has been created for it
+            assert factory_calls == ["first"]
+
+            release_first.set()
+            second_handle = await producer
+            await second_handle
+            assert factory_calls == ["first", "second"]
+
+        assert finished == ["first", "second"]
+
+    async def test_task_exception_propagates(self) -> None:
+        """Exceptions from submitted tasks follow the task group rules."""
+        with pytest.raises(ExceptionGroup) as exc_info:
+            async with create_task_group() as tg:
+                submitter = tg.create_bounded_submitter(1)
+                handle = await submitter.submit(async_error, "boom", 0)
+
+        assert handle.status is TaskHandle.Status.FAILED
+        assert len(exc_info.value.exceptions) == 1
+        assert str(exc_info.value.exceptions[0]) == "boom"
+
+    async def test_submit_after_close_is_rejected(self) -> None:
+        factory_calls: list[str] = []
+
+        async def func() -> None:
+            factory_calls.append("func")
+
+        async with create_task_group() as tg:
+            async with tg.create_bounded_submitter(1) as submitter:
+                assert not submitter.closed
+
+            assert submitter.closed
+            with pytest.raises(ClosedResourceError):
+                await submitter.submit(func)
+
+            assert factory_calls == []
+
+    async def test_close_racing_submit_wakes_blocked_producer(self) -> None:
+        """
+        Reproduce the close/submit interleaving with a barrier: the producer
+        gets past the initial closed-check and blocks waiting for a slot, then
+        close() must wake it up with ClosedResourceError, while the already
+        accepted task is still left for the task group to finish.
+        """
+        barrier = _Barrier()
+        release_first = Event()
+        rejected = Event()
+        first_finished = Event()
+        factory_calls: list[str] = []
+
+        async def first() -> None:
+            await release_first.wait()
+            first_finished.set()
+
+        async def second() -> None:
+            factory_calls.append("second")
+
+        async def producer() -> None:
+            await barrier.wait()
+            with pytest.raises(ClosedResourceError):
+                await submitter.submit(second)
+
+            rejected.set()
+
+        async with create_task_group() as tg:
+            submitter = tg.create_bounded_submitter(1)
+            await submitter.submit(first)  # occupies the only slot
+            tg.start_soon(producer)
+            await barrier.wait()  # the producer has entered submit()...
+            await wait_all_tasks_blocked()  # ...and is now blocked on a slot
+            submitter.close()
+            await rejected.wait()
+
+            # The rejected submission never called the factory
+            assert factory_calls == []
+
+            # The accepted task is still finished by the task group
+            release_first.set()
+
+        assert first_finished.is_set()
+
+    async def test_cancelled_waiter_does_not_leak_slot(self) -> None:
+        release_first = Event()
+        factory_calls: list[str] = []
+
+        async def first() -> None:
+            await release_first.wait()
+
+        async def second() -> None:
+            factory_calls.append("second")
+
+        async def third() -> None:
+            factory_calls.append("third")
+
+        async with create_task_group() as tg:
+            submitter = tg.create_bounded_submitter(1)
+            await submitter.submit(first)  # occupies the only slot
+            producer = tg.start_soon(submitter.submit, second)
+            await wait_all_tasks_blocked()
+            producer.cancel()
+            with pytest.raises(TaskCancelled):
+                await producer
+
+            # The cancelled submission never secured a slot, so the factory
+            # must not have been called
+            assert factory_calls == []
+
+            # The slot must not have been leaked: once the first task
+            # finishes, a new submission can proceed
+            release_first.set()
+            with fail_after(5):
+                third_handle = await submitter.submit(third)
+                await third_handle
+
+            assert factory_calls == ["third"]
+
+    async def test_accepted_task_survives_producer_cancellation(self) -> None:
+        task_started = Event()
+        release_task = Event()
+        task_finished = Event()
+        producer_scope: list[CancelScope] = []
+
+        async def func() -> None:
+            task_started.set()
+            await release_task.wait()
+            task_finished.set()
+
+        async def producer() -> None:
+            with CancelScope() as scope:
+                producer_scope.append(scope)
+                await submitter.submit(func)
+                await sleep_forever()
+
+        async with create_task_group() as tg:
+            submitter = tg.create_bounded_submitter(1)
+            tg.start_soon(producer)
+            await task_started.wait()
+
+            # Cancel the producer after its submission was accepted; the
+            # accepted task must remain tracked by the task group
+            producer_scope[0].cancel()
+            release_task.set()
+
+        assert task_finished.is_set()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import sys
 from collections.abc import (
+    Callable,
     Coroutine,
     Generator,
 )
@@ -13,8 +14,14 @@ from types import TracebackType
 from typing import Any, Generic, final
 
 from ..abc import TaskGroup, TaskStatus
+from ..abc._tasks import call_for_coroutine, get_callable_name
 from ._eventloop import get_async_backend, get_cancelled_exc_class
-from ._exceptions import TaskCancelled, TaskFailed, TaskNotFinished
+from ._exceptions import (
+    ClosedResourceError,
+    TaskCancelled,
+    TaskFailed,
+    TaskNotFinished,
+)
 
 if sys.version_info >= (3, 13):
     from typing import TypeVar
@@ -22,9 +29,9 @@ else:
     from typing_extensions import TypeVar
 
 if sys.version_info >= (3, 11):
-    from typing import Never, Self, TypeVarTuple
+    from typing import Never, Self, TypeVarTuple, Unpack
 else:
-    from typing_extensions import Never, Self, TypeVarTuple
+    from typing_extensions import Never, Self, TypeVarTuple, Unpack
 
 T = TypeVar("T")
 T_co = TypeVar("T_co", covariant=True)
@@ -245,6 +252,134 @@ def create_task_group() -> TaskGroup:
 
     """
     return get_async_backend().create_task_group()
+
+
+class BoundedTaskSubmitter:
+    """
+    A bounded task submitter for a :class:`~.abc.TaskGroup`.
+
+    Submitting a task through this object waits until fewer than ``capacity``
+    previously submitted tasks are still running. A slot is only released when
+    the corresponding task has actually finished, so at most ``capacity``
+    tasks submitted through this object are ever running at the same time.
+
+    The submitter can be closed with :meth:`close` (or implicitly by exiting
+    the asynchronous context manager). Closing rejects new submissions with
+    :exc:`ClosedResourceError` and wakes up producers blocked in
+    :meth:`submit`, while tasks that were already accepted are left for the
+    task group to finish.
+
+    If a :meth:`submit` call is cancelled before a slot was secured, the
+    coroutine function is never called. Once a submission has been accepted,
+    the task is tracked by the task group and is unaffected by cancellation of
+    the submitting task.
+
+    :ivar capacity: the maximum number of concurrently running tasks
+
+    .. versionadded:: 4.15.0
+    """
+
+    __slots__ = ("__weakref__", "_capacity", "_closed", "_slots", "_task_group")
+
+    def __init__(self, task_group: TaskGroup, capacity: int) -> None:
+        from ._synchronization import Semaphore
+
+        if not isinstance(capacity, int):
+            raise TypeError("capacity must be an integer")
+        if capacity < 1:
+            raise ValueError("capacity must be at least 1")
+
+        self._task_group = task_group
+        self._capacity = capacity
+        self._slots = Semaphore(capacity)
+        self._closed = False
+
+    @property
+    def capacity(self) -> int:
+        """The maximum number of concurrently running tasks."""
+        return self._capacity
+
+    @property
+    def closed(self) -> bool:
+        """``True`` if :meth:`close` has been called."""
+        return self._closed
+
+    async def submit(
+        self,
+        func: Callable[[Unpack[PosArgsT]], Coroutine[Any, Any, T_co]],
+        *args: Unpack[PosArgsT],
+        name: object = None,
+    ) -> TaskHandle[T_co]:
+        """
+        Submit a task to the task group, waiting for a free slot if necessary.
+
+        The coroutine function is only called, in the new task, once a slot
+        has been secured, and the slot is released when the task finishes.
+
+        :param func: a coroutine function
+        :param args: positional arguments to call the function with
+        :param name: name of the task, for the purposes of introspection and
+            debugging
+        :return: a task handle
+        :raises ClosedResourceError: if the submitter has been closed
+
+        """
+        if self._closed:
+            raise ClosedResourceError("the submitter has been closed")
+
+        await self._slots.acquire()
+        if self._closed:
+            # close() raced with the acquisition; pass the slot on so that
+            # any other waiting producer gets to bail out too
+            self._slots.release()
+            raise ClosedResourceError("the submitter has been closed")
+
+        final_name = get_callable_name(func, name)
+        try:
+            return self._task_group.start_soon(
+                self._run_task, func, args, name=final_name
+            )
+        except BaseException:
+            self._slots.release()
+            raise
+
+    async def _run_task(
+        self,
+        func: Callable[[Unpack[PosArgsT]], Coroutine[Any, Any, T_co]],
+        args: tuple[Unpack[PosArgsT]],
+    ) -> T_co:
+        try:
+            return await call_for_coroutine(func, args)
+        finally:
+            self._slots.release()
+
+    def close(self) -> None:
+        """
+        Close the submitter.
+
+        New submissions are rejected with :exc:`ClosedResourceError`, and
+        producers currently blocked in :meth:`submit` are woken up with the
+        same exception. Tasks that have already been accepted are unaffected
+        and are left for the task group to finish.
+
+        This method is idempotent.
+        """
+        if not self._closed:
+            self._closed = True
+            # Wake up one waiting producer; each woken producer re-releases
+            # the slot, cascading the wakeup to the rest of the waiters
+            self._slots.release()
+
+    async def __aenter__(self) -> BoundedTaskSubmitter:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        self.close()
 
 
 @final
