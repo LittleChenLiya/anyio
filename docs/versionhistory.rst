@@ -67,6 +67,14 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
   (`#1241 <https://github.com/agronholm/anyio/pull/1241>`_; PR by @davidbrochart)
 - Added the ``move_on_at()`` and ``fail_at()`` functions to complement
   ``move_on_after()`` and ``fail_after()``
+- Added ``anyio.KeyedTaskGroup``, a component on top of :class:`~anyio.TaskGroup` that
+  runs at most one task per key. Starting a task for a key that already has a running
+  task cancels the previous task and starts a new generation; tasks for different keys
+  run concurrently. Only the current generation may publish its outcome — an old task
+  that shields against cancellation and finishes late has its result, exception, or
+  cancellation silently discarded. Results, exceptions, and cancellations are notified
+  through three separate callbacks, and closing the component waits for in-flight tasks
+  to finish while rejecting new tasks
 - Changed the default name for a task spawned with ``TaskGroup.create_task(func())`` to
   match the default task name for the analogous task spawned with
   ``TaskGroup.start_soon(func)`` or ``TaskGroup.start(func)`` in more situations.

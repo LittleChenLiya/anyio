@@ -373,3 +373,82 @@ This results in an output like:
                   |   File '/tmp/foo.py', line 11, in async foo()
 
 .. _call graph introspection: https://docs.python.org/3.14/library/asyncio-graph.html
+
+Keyed task groups
+-----------------
+
+.. py:currentmodule:: anyio
+
+A *keyed task group* runs at most one task per key. It is built on top of the regular
+:class:`~.TaskGroup` and is useful when you want to start a task for a given key,
+replacing any previously running task for that key while letting tasks for other keys
+run concurrently.
+
+Starting a task for a key that already has a running task cancels the previous task and
+starts a new *generation* for that key. The old task receives a cancellation, but it may
+shield against cancellation and finish late. Even so, only the current generation may
+publish its outcome — the old task's result (or exception, or cancellation) is silently
+discarded, so it can never override the new generation's result.
+
+Outcomes are reported through three separate callbacks, so a cancellation is never
+confused with a ``None`` result:
+
+* ``on_result(key, value)`` — the task finished successfully with ``value``
+* ``on_exception(key, exc)`` — the task raised exception ``exc``
+* ``on_cancel(key)`` — the task was cancelled
+
+Here's a demonstration::
+
+    from anyio import Event, KeyedTaskGroup, CancelScope, sleep, wait_all_tasks_blocked
+
+
+    async def main():
+        started = Event()
+        finish = Event()
+        results = []
+
+        async def old_task():
+            started.set()
+            with CancelScope(shield=True):
+                await finish.wait()
+            return "old"
+
+        async def new_task():
+            return "new"
+
+        async with KeyedTaskGroup(
+            on_result=lambda key, value: results.append((key, value))
+        ) as ktg:
+            ktg.start("a", old_task)
+            await started.wait()
+            await wait_all_tasks_blocked()
+            ktg.start("a", new_task)  # cancels the old "a" task
+            finish.set()              # lets the old task finish late
+
+        # Only the new generation's result is published.
+        assert results == [("a", "new")]
+
+Lifecycle
+~~~~~~~~~
+
+:class:`~.KeyedTaskGroup` is an asynchronous context manager:
+
+#. **Before entering** (``__aenter__``), :meth:`~.KeyedTaskGroup.start` raises
+   :class:`RuntimeError` — the component is not active.
+#. **While active**, :meth:`~.KeyedTaskGroup.start` accepts tasks. Each call for a key
+   increments that key's generation and cancels the previous generation's task.
+#. **On exit** (``__aexit__``), the component closes itself to new tasks (subsequent
+   :meth:`~.KeyedTaskGroup.start` calls raise :class:`RuntimeError`) and then waits for
+   all in-flight tasks to finish, just like a regular :class:`~.TaskGroup`.
+
+The :attr:`~.KeyedTaskGroup.closed` property reflects whether the component has been
+closed.
+
+Controllable race tests
+~~~~~~~~~~~~~~~~~~~~~~~
+
+The test suite uses :class:`~.Event` to deterministically control the order in which
+same-key tasks finish, so that stale-generation outcomes can be observed and asserted
+against without relying on timing. Run them with::
+
+    pytest tests/test_keyed_tasks.py -v

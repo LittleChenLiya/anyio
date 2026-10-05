@@ -95,6 +95,7 @@ if TYPE_CHECKING or not install_lazy_importer():
     from ._core._synchronization import ResourceGuard as ResourceGuard
     from ._core._synchronization import Semaphore as Semaphore
     from ._core._synchronization import SemaphoreStatistics as SemaphoreStatistics
+    from ._core._keyed_tasks import KeyedTaskGroup as KeyedTaskGroup
     from ._core._tasks import TASK_STATUS_IGNORED as TASK_STATUS_IGNORED
     from ._core._tasks import CancelScope as CancelScope
     from ._core._tasks import TaskHandle as TaskHandle
