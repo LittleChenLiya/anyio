@@ -5,6 +5,13 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added :class:`~.from_thread.Completion`, a one-shot completion unit bound to an
+  event loop and its :class:`~.from_thread.BlockingPortal`. Worker threads can submit
+  a result or exception that multiple asynchronous waiters share; the first
+  submission finalized atomically through the portal wins, and later submissions are
+  rejected. Closing the unit (or its portal) wakes unfinished waiters and rejects
+  further submissions, while submitted exceptions are re-raised with fresh tracebacks
+  so waiters' tracebacks are not chained together
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends

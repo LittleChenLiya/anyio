@@ -267,6 +267,95 @@ at the same time, the same blocking portal will be used to handle the async call
 inside. It's easy to see that this is much more efficient than having each call spawn
 its own blocking portal.
 
+One-shot completion units
+-------------------------
+
+Sometimes a worker thread needs to hand a single result (or exception) back to the
+event loop, and several asynchronous tasks may be waiting for that result. The
+:class:`~.from_thread.Completion` unit provides exactly this: a one-shot, thread-safe
+completion point bound to an event loop and its :class:`~.from_thread.BlockingPortal`.
+
+A completion unit is created in the event loop thread (e.g. via
+``portal.call(Completion, portal)``). Worker threads then call
+:meth:`~.from_thread.Completion.submit` or
+:meth:`~.from_thread.Completion.submit_exception` to finalize the result. The first
+submission to be finalized wins; later submissions return ``False``. Asynchronous tasks
+call :meth:`~.from_thread.Completion.wait` to receive the result (or have the submitted
+exception re-raised).
+
+Submissions are finalized atomically in the event loop thread through the portal — the
+unit never sets its event directly from a worker thread. Cancelling a waiter does not
+affect the unit or the other waiters.
+
+The following example shows two worker threads competing to submit a result, while three
+asynchronous tasks wait for it (one of them being cancelled)::
+
+    import threading
+
+    from anyio import CancelScope, create_task_group, sleep, to_thread
+    from anyio.from_thread import BlockingPortal, Completion
+
+    async def main():
+        async with BlockingPortal() as portal:
+            completion = Completion(portal)
+            results = {}
+            cancel_scope = CancelScope()
+
+            async def waiter(index, cancel=False):
+                try:
+                    if cancel:
+                        with cancel_scope:
+                            results[index] = await completion.wait()
+                    else:
+                        results[index] = await completion.wait()
+                except BaseException as exc:
+                    results[index] = type(exc).__name__
+
+            def worker(value):
+                return completion.submit(value)
+
+            async with create_task_group() as tg:
+                tg.start_soon(waiter, 1)
+                tg.start_soon(waiter, 2, True)
+                tg.start_soon(waiter, 3)
+                await sleep(0.05)
+                cancel_scope.cancel()
+                t1 = threading.Thread(target=worker, args=("a",))
+                t2 = threading.Thread(target=worker, args=("b",))
+                t1.start()
+                t2.start()
+                await to_thread.run_sync(t1.join)
+                await to_thread.run_sync(t2.join)
+
+            # results[1] == results[3] == "a" (or "b"), results[2] was cancelled
+
+    import anyio
+    anyio.run(main)
+
+``None`` is a legitimate success value — it is not confused with "no result yet".
+
+Lifecycle
++++++++++
+
+A completion unit is either *open* (accepting submissions) or *closed*. It transitions
+to the closed state when:
+
+* :meth:`~.from_thread.Completion.close` is called (from any thread), or
+* the unit's :class:`~.from_thread.BlockingPortal` is stopped.
+
+When the unit closes, unfinished waiters are woken up and raise
+:class:`~.CompletionClosed`. Submissions after closing are rejected:
+
+* If the unit is closed but the portal is still running,
+  :meth:`~.from_thread.Completion.submit` raises :class:`~.CompletionClosed`.
+* If the portal itself has stopped, :meth:`~.from_thread.Completion.submit` raises
+  :class:`RuntimeError` ("This portal is not running") — the submission is reported as
+  unreachable, never faked as successful.
+
+Exceptions submitted via :meth:`~.from_thread.Completion.submit_exception` are
+re-raised in waiters with a fresh traceback, so waiters' tracebacks are not chained
+together (nor do they include the submitting thread's frames).
+
 Context propagation
 -------------------
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 __all__ = (
     "BlockingPortal",
     "BlockingPortalProvider",
+    "Completion",
     "check_cancelled",
     "run",
     "run_sync",
@@ -36,7 +37,7 @@ from ._core._eventloop import (
     threadlocals,
 )
 from ._core._eventloop import run as run_eventloop
-from ._core._exceptions import NoEventLoopError
+from ._core._exceptions import CompletionClosed, NoEventLoopError
 from ._core._synchronization import Event
 from ._core._tasks import CancelScope, create_task_group
 from .abc._tasks import TaskStatus
@@ -500,6 +501,130 @@ class BlockingPortalProvider:
 
         if portal_cm:
             portal_cm.__exit__(None, None, None)
+
+
+_NO_VALUE: Any = object()
+
+
+class Completion(Generic[T_Retval]):
+    """
+    A one-shot completion unit bound to an event loop and its
+    :class:`BlockingPortal`.
+
+    A completion unit lets worker threads submit a single result (or exception)
+    that multiple asynchronous waiters in the event loop can wait for. The first
+    submission to be finalized wins; later submissions are rejected. Cancelling a
+    waiter does not affect the unit or the other waiters.
+
+    Submissions are finalized atomically in the event loop thread through the
+    portal — the unit never sets its event directly from a worker thread. When
+    the unit (or its portal) is closed, unfinished waiters are woken up and
+    submissions are rejected.
+
+    The unit must be created in the event loop thread (e.g. via
+    ``portal.call(Completion, portal)``) while the portal is running.
+
+    .. versionadded:: 4.16.0
+    """
+
+    def __init__(self, portal: BlockingPortal) -> None:
+        self._portal = portal
+        self._event = Event()
+        self._result: Any = _NO_VALUE
+        self._exception: BaseException | None = None
+        self._closed = False
+        portal._task_group.start_soon(
+            self._watch_portal, name="completion portal watcher"
+        )
+
+    async def _watch_portal(self) -> None:
+        await self._portal.sleep_until_stopped()
+        self._close()
+
+    def _close(self) -> None:
+        self._closed = True
+        self._event.set()
+
+    def close(self) -> None:
+        """
+        Close the completion unit, waking up all unfinished waiters.
+
+        Waiters that have not yet received a result will raise
+        :class:`CompletionClosed`. Submissions after closing are rejected.
+
+        """
+        if self._portal._event_loop_thread_id == get_ident():
+            self._close()
+        else:
+            self._portal.call(self._close)
+
+    def _set_result(self, value: T_Retval) -> bool:
+        if self._closed:
+            raise CompletionClosed("the completion unit has been closed")
+        if self._event.is_set():
+            return False
+        self._result = value
+        self._event.set()
+        return True
+
+    def submit(self, value: T_Retval) -> bool:
+        """
+        Submit a successful result from a worker thread.
+
+        The submission is finalized atomically in the event loop thread through
+        the portal.
+
+        :return: ``True`` if this submission was the first one and got
+            finalized, ``False`` if the unit had already been completed (but not
+            closed)
+        :raises CompletionClosed: if the unit has been closed
+        :raises RuntimeError: if the portal is not running
+
+        """
+        return self._portal.call(partial(self._set_result, value))
+
+    def _set_exception(self, exc: BaseException) -> bool:
+        if self._closed:
+            raise CompletionClosed("the completion unit has been closed")
+        if self._event.is_set():
+            return False
+        self._exception = exc
+        self._event.set()
+        return True
+
+    def submit_exception(self, exc: BaseException) -> bool:
+        """
+        Submit an exception from a worker thread.
+
+        The submission is finalized atomically in the event loop thread through
+        the portal.
+
+        :return: ``True`` if this submission was the first one and got
+            finalized, ``False`` if the unit had already been completed (but not
+            closed)
+        :raises CompletionClosed: if the unit has been closed
+        :raises RuntimeError: if the portal is not running
+
+        """
+        return self._portal.call(partial(self._set_exception, exc))
+
+    async def wait(self) -> T_Retval:
+        """
+        Wait for the first submission to be finalized.
+
+        :return: the successful result
+        :raises CompletionClosed: if the unit was closed before a result was
+            finalized
+        :raises BaseException: the submitted exception (with a fresh traceback,
+            so waiters' tracebacks are not chained together)
+
+        """
+        await self._event.wait()
+        if self._exception is not None:
+            raise self._exception.with_traceback(None) from None
+        if self._result is not _NO_VALUE:
+            return self._result
+        raise CompletionClosed("the completion unit was closed before it completed")
 
 
 @contextmanager

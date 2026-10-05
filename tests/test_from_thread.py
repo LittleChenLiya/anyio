@@ -4,6 +4,7 @@ import math
 import sys
 import threading
 import time
+import traceback
 from collections.abc import AsyncGenerator, Callable, Coroutine
 from concurrent import futures
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
@@ -16,6 +17,7 @@ from pytest import LogCaptureFixture
 
 from anyio import (
     CancelScope,
+    CompletionClosed,
     Event,
     NoEventLoopError,
     RunFinishedError,
@@ -30,7 +32,7 @@ from anyio import (
     to_thread,
     wait_all_tasks_blocked,
 )
-from anyio.from_thread import BlockingPortal, start_blocking_portal
+from anyio.from_thread import BlockingPortal, Completion, start_blocking_portal
 from anyio.lowlevel import EventLoopToken, checkpoint, current_token
 
 from .conftest import asyncio_params, return_non_coro_awaitable
@@ -812,3 +814,187 @@ class TestBlockingPortal:
                 # Ensure thread has time to start the task
                 await event.wait()
                 await portal.stop(cancel_remaining=True)
+
+
+class TestCompletion:
+    async def test_two_threads_compete(self) -> None:
+        """Two threads submit concurrently; exactly one wins."""
+        async with BlockingPortal() as portal:
+            completion = Completion(portal)
+            results: list[bool] = []
+            barrier = threading.Barrier(2)
+
+            def worker(value: str) -> None:
+                barrier.wait()
+                results.append(completion.submit(value))
+
+            t1 = threading.Thread(target=worker, args=("a",))
+            t2 = threading.Thread(target=worker, args=("b",))
+            t1.start()
+            t2.start()
+            await to_thread.run_sync(t1.join)
+            await to_thread.run_sync(t2.join)
+
+            assert results.count(True) == 1
+            assert results.count(False) == 1
+
+    async def test_three_waiters_one_cancelled(self) -> None:
+        """Three waiters; cancelling one leaves the others sharing the result."""
+        async with BlockingPortal() as portal:
+            completion = Completion(portal)
+            results: dict[int, object] = {}
+            cancel_scope = CancelScope()
+
+            async def waiter(index: int, cancel: bool = False) -> None:
+                try:
+                    if cancel:
+                        with cancel_scope:
+                            results[index] = await completion.wait()
+                    else:
+                        results[index] = await completion.wait()
+                except BaseException as exc:
+                    results[index] = type(exc).__name__
+
+            async with create_task_group() as tg:
+                tg.start_soon(waiter, 1)
+                tg.start_soon(waiter, 2, True)
+                tg.start_soon(waiter, 3)
+                await sleep(0.05)
+                cancel_scope.cancel()
+                await to_thread.run_sync(completion.submit, "shared")
+
+            assert results[1] == "shared"
+            assert results[3] == "shared"
+            assert cancel_scope.cancel_called
+
+    async def test_none_is_valid_success_value(self) -> None:
+        """``None`` is a legitimate success value, not a missing result."""
+        async with BlockingPortal() as portal:
+            completion = Completion(portal)
+            assert await to_thread.run_sync(completion.submit, None) is True
+            assert await completion.wait() is None
+
+    async def test_multiple_waiters_share_result(self) -> None:
+        """All concurrent waiters receive the same finalized result."""
+        async with BlockingPortal() as portal:
+            completion = Completion(portal)
+            results: list[object] = []
+
+            async def waiter() -> None:
+                results.append(await completion.wait())
+
+            async with create_task_group() as tg:
+                for _ in range(5):
+                    tg.start_soon(waiter)
+                await sleep(0.05)
+                await to_thread.run_sync(completion.submit, {"key": "value"})
+
+            assert len(results) == 5
+            assert all(r == {"key": "value"} for r in results)
+
+    async def test_submit_after_completed_returns_false(self) -> None:
+        """Submitting after the unit already completed returns ``False``."""
+        async with BlockingPortal() as portal:
+            completion = Completion(portal)
+            assert await to_thread.run_sync(completion.submit, "first") is True
+            assert await to_thread.run_sync(completion.submit, "second") is False
+            assert (
+                await to_thread.run_sync(completion.submit_exception, ValueError())
+                is False
+            )
+            assert await completion.wait() == "first"
+
+    async def test_submit_after_close_rejected(self) -> None:
+        """Submitting after closing raises :class:`CompletionClosed`."""
+        async with BlockingPortal() as portal:
+            completion = Completion(portal)
+            completion.close()
+            with pytest.raises(CompletionClosed):
+                await to_thread.run_sync(completion.submit, "x")
+            with pytest.raises(CompletionClosed):
+                await to_thread.run_sync(completion.submit_exception, ValueError())
+
+    async def test_wait_after_close_raises(self) -> None:
+        """Waiting after closing raises :class:`CompletionClosed`."""
+        async with BlockingPortal() as portal:
+            completion = Completion(portal)
+            completion.close()
+            with pytest.raises(CompletionClosed):
+                await completion.wait()
+
+    async def test_close_wakes_waiters(self) -> None:
+        """Closing wakes unfinished waiters with :class:`CompletionClosed`."""
+        async with BlockingPortal() as portal:
+            completion = Completion(portal)
+            results: dict[int, str] = {}
+
+            async def waiter(index: int) -> None:
+                try:
+                    results[index] = await completion.wait()
+                except BaseException as exc:
+                    results[index] = type(exc).__name__
+
+            async with create_task_group() as tg:
+                tg.start_soon(waiter, 1)
+                tg.start_soon(waiter, 2)
+                await sleep(0.05)
+                completion.close()
+
+            assert results[1] == "CompletionClosed"
+            assert results[2] == "CompletionClosed"
+
+    async def test_exception_tracebacks_not_chained(self) -> None:
+        """Waiters get the submitted exception with independent tracebacks."""
+        async with BlockingPortal() as portal:
+            completion = Completion(portal)
+            try:
+                raise ValueError("boom")
+            except ValueError as exc:
+                submitted = exc
+
+            await to_thread.run_sync(completion.submit_exception, submitted)
+
+            async def waiter() -> str:
+                try:
+                    await completion.wait()
+                except ValueError:
+                    return traceback.format_exc()
+                return ""
+
+            tb1 = await waiter()
+            tb2 = await waiter()
+            # Each traceback starts fresh at the waiter; the submitter's and
+            # the other waiter's frames are not chained in.
+            assert tb1.count("File") == 2
+            assert tb2.count("File") == 2
+            assert "boom" in tb1
+            assert "boom" in tb2
+
+    def test_portal_stop_wakes_waiters(
+        self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
+    ) -> None:
+        """Stopping the portal wakes unfinished waiters."""
+        with start_blocking_portal(anyio_backend_name, anyio_backend_options) as portal:
+            completion = portal.call(Completion, portal)
+
+            async def waiter() -> str:
+                try:
+                    await completion.wait()
+                    return "got result"
+                except BaseException as exc:
+                    return type(exc).__name__
+
+            future = portal.start_task_soon(waiter)
+            portal.call(wait_all_tasks_blocked)
+
+        assert future.result() == "CompletionClosed"
+
+    def test_submit_after_portal_stop_rejected(
+        self, anyio_backend_name: str, anyio_backend_options: dict[str, Any]
+    ) -> None:
+        """Submitting after the portal has stopped is rejected, not faked."""
+        with start_blocking_portal(anyio_backend_name, anyio_backend_options) as portal:
+            completion = portal.call(Completion, portal)
+
+        with pytest.raises(RuntimeError, match="not running"):
+            completion.submit("x")

@@ -76,6 +76,9 @@ Running asynchronous code from other threads
 
 .. autoclass:: anyio.from_thread.BlockingPortal
 .. autoclass:: anyio.from_thread.BlockingPortalProvider
+.. autoclass:: anyio.from_thread.Completion
+
+.. autoexception:: anyio.CompletionClosed
 
 Async file I/O
 --------------

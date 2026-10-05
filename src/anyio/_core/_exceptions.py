@@ -72,6 +72,13 @@ class ClosedResourceError(Exception):
     """Raised when trying to use a resource that has been closed."""
 
 
+class CompletionClosed(Exception):
+    """
+    Raised when trying to submit to, or wait on, a :class:`~.from_thread.Completion`
+    that has been closed.
+    """
+
+
 class ConnectionFailed(OSError):
     """
     Raised when a connection attempt fails.

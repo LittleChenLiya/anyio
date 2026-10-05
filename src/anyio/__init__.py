@@ -29,6 +29,7 @@ if TYPE_CHECKING or not install_lazy_importer():
     from ._core._exceptions import BrokenWorkerProcess as BrokenWorkerProcess
     from ._core._exceptions import BusyResourceError as BusyResourceError
     from ._core._exceptions import ClosedResourceError as ClosedResourceError
+    from ._core._exceptions import CompletionClosed as CompletionClosed
     from ._core._exceptions import ConnectionFailed as ConnectionFailed
     from ._core._exceptions import DelimiterNotFound as DelimiterNotFound
     from ._core._exceptions import EndOfStream as EndOfStream
